@@ -303,24 +303,35 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 		rightContent = "  " + line.Content
 	}
 
-	// Truncate content to fit column width
-	contentWidth := columnWidth - 8 // Account for line numbers
-	if contentWidth < 3 {
-		contentWidth = 3
+	// Calculate content width based on whether line numbers are shown
+	contentWidth := columnWidth
+	if m.config.ShowLineNo {
+		contentWidth = columnWidth - 8 // Account for line numbers (5 digits + 1 space + padding)
 	}
 
-	if len(leftContent) > contentWidth {
-		if contentWidth > 3 {
-			leftContent = leftContent[:contentWidth-3] + "..."
-		} else {
+	// Ensure minimum width
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+
+	// Safely truncate content to fit column width
+	if len(leftContent) > contentWidth && contentWidth > 3 {
+		leftContent = leftContent[:contentWidth-3] + "..."
+	} else if len(leftContent) > contentWidth {
+		if contentWidth > 0 {
 			leftContent = leftContent[:contentWidth]
+		} else {
+			leftContent = ""
 		}
 	}
-	if len(rightContent) > contentWidth {
-		if contentWidth > 3 {
-			rightContent = rightContent[:contentWidth-3] + "..."
-		} else {
+
+	if len(rightContent) > contentWidth && contentWidth > 3 {
+		rightContent = rightContent[:contentWidth-3] + "..."
+	} else if len(rightContent) > contentWidth {
+		if contentWidth > 0 {
 			rightContent = rightContent[:contentWidth]
+		} else {
+			rightContent = ""
 		}
 	}
 
