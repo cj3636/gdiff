@@ -49,7 +49,10 @@ func usage() {
 	fmt.Println("  u      Scroll half page up")
 	fmt.Println("  g      Go to top")
 	fmt.Println("  G      Go to bottom")
-	fmt.Println("  ?/h    Toggle help")
+	fmt.Println("  v      Toggle side-by-side view")
+	fmt.Println("  c      Toggle syntax highlighting")
+	fmt.Println("  s      Toggle statistics panel")
+	fmt.Println("  ?/h    Toggle help panel")
 	fmt.Println("  q      Quit")
 }
 

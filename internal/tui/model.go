@@ -305,11 +305,23 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 
 	// Truncate content to fit column width
 	contentWidth := columnWidth - 8 // Account for line numbers
+	if contentWidth < 3 {
+		contentWidth = 3
+	}
+
 	if len(leftContent) > contentWidth {
-		leftContent = leftContent[:contentWidth-3] + "..."
+		if contentWidth > 3 {
+			leftContent = leftContent[:contentWidth-3] + "..."
+		} else {
+			leftContent = leftContent[:contentWidth]
+		}
 	}
 	if len(rightContent) > contentWidth {
-		rightContent = rightContent[:contentWidth-3] + "..."
+		if contentWidth > 3 {
+			rightContent = rightContent[:contentWidth-3] + "..."
+		} else {
+			rightContent = rightContent[:contentWidth]
+		}
 	}
 
 	// Pad to column width
@@ -442,11 +454,13 @@ func (m Model) renderStatsPanel() string {
 	addedPercent := 0.0
 	removedPercent := 0.0
 	unchangedPercent := 0.0
+	changePercent := 0.0
 
 	if total > 0 {
 		addedPercent = float64(added) * 100.0 / float64(total)
 		removedPercent = float64(removed) * 100.0 / float64(total)
 		unchangedPercent = float64(unchanged) * 100.0 / float64(total)
+		changePercent = (float64(added+removed) * 100.0) / float64(total)
 	}
 
 	statsText := []string{
@@ -459,7 +473,7 @@ func (m Model) renderStatsPanel() string {
 		"",
 		fmt.Sprintf("Total: %d lines  │  Added: %d (%.1f%%)  │  Removed: %d (%.1f%%)  │  Unchanged: %d (%.1f%%)",
 			total, added, addedPercent, removed, removedPercent, unchanged, unchangedPercent),
-		fmt.Sprintf("Changes: %d (%.1f%% of total)", added+removed, (float64(added+removed)*100.0)/float64(total)),
+		fmt.Sprintf("Changes: %d (%.1f%% of total)", added+removed, changePercent),
 		"",
 	}
 
