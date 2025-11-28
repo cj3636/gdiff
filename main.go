@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"os"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cj3636/gdiff/internal/config"
 	"github.com/cj3636/gdiff/internal/diff"
 	"github.com/cj3636/gdiff/internal/tui"
-	tea "github.com/charmbracelet/bubbletea"
 	flag "github.com/spf13/pflag"
 )
 
@@ -109,7 +109,7 @@ func main() {
 	// Create and run the TUI
 	model := tui.NewModel(diffResult, cfg)
 	p := tea.NewProgram(model, tea.WithAltScreen())
-	
+
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)
 		os.Exit(1)

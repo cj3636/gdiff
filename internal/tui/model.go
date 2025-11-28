@@ -4,23 +4,27 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cj3636/gdiff/internal/config"
-	"github.com/cj3636/gdiff/internal/diff"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/cj3636/gdiff/internal/config"
+	"github.com/cj3636/gdiff/internal/diff"
 )
 
 // Model represents the application state
 type Model struct {
-	diffResult *diff.DiffResult
-	config     *config.Config
-	styles     *Styles
-	viewport   Viewport
-	width      int
-	height     int
-	showHelp   bool
-	showStats  bool
-	err        error
+	diffResult       *diff.DiffResult
+	config           *config.Config
+	styles           *Styles
+	viewport         Viewport
+	width            int
+	height           int
+	showHelp         bool
+	showStats        bool
+	sideBySideMode   bool
+	syntaxHighlight  bool
+	err              error
+	helpPanelHeight  int
+	statsPanelHeight int
 }
 
 // Viewport controls the visible portion of the diff
@@ -31,25 +35,30 @@ type Viewport struct {
 
 // Styles holds all the lipgloss styles
 type Styles struct {
-	added       lipgloss.Style
-	removed     lipgloss.Style
-	unchanged   lipgloss.Style
-	lineNumber  lipgloss.Style
-	border      lipgloss.Style
-	title       lipgloss.Style
-	help        lipgloss.Style
-	statusBar   lipgloss.Style
+	added      lipgloss.Style
+	removed    lipgloss.Style
+	unchanged  lipgloss.Style
+	lineNumber lipgloss.Style
+	border     lipgloss.Style
+	title      lipgloss.Style
+	help       lipgloss.Style
+	statusBar  lipgloss.Style
 }
 
 // NewModel creates a new TUI model
 func NewModel(diffResult *diff.DiffResult, cfg *config.Config) Model {
 	styles := createStyles(cfg.Theme)
 	return Model{
-		diffResult: diffResult,
-		config:     cfg,
-		styles:     styles,
-		viewport:   Viewport{offset: 0, height: 20},
-		showHelp:   false,
+		diffResult:       diffResult,
+		config:           cfg,
+		styles:           styles,
+		viewport:         Viewport{offset: 0, height: 20},
+		showHelp:         false,
+		showStats:        false,
+		sideBySideMode:   false,
+		syntaxHighlight:  true, // Default to enabled
+		helpPanelHeight:  12,
+		statsPanelHeight: 17,
 	}
 }
 
@@ -100,8 +109,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "?", "h":
 			m.showHelp = !m.showHelp
+			// Close stats if opening help
+			if m.showHelp {
+				m.showStats = false
+			}
+			m.updateViewportHeight()
 		case "s":
 			m.showStats = !m.showStats
+			// Close help if opening stats
+			if m.showStats {
+				m.showHelp = false
+			}
+			m.updateViewportHeight()
+		case "v":
+			m.sideBySideMode = !m.sideBySideMode
+		case "c":
+			m.syntaxHighlight = !m.syntaxHighlight
 		case "j", "down":
 			m.scrollDown()
 		case "k", "up":
@@ -119,7 +142,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.viewport.height = msg.Height - 4 // Reserve space for header and footer
+		m.updateViewportHeight()
 	}
 
 	return m, nil
@@ -140,13 +163,14 @@ func (m Model) View() string {
 	// Title
 	sections = append(sections, m.renderTitle())
 
-	// Main content
+	// Main diff content (always shown)
+	sections = append(sections, m.renderDiff())
+
+	// Bottom panel (help or stats) - shown below main view if toggled
 	if m.showHelp {
-		sections = append(sections, m.renderHelp())
+		sections = append(sections, m.renderHelpPanel())
 	} else if m.showStats {
-		sections = append(sections, m.renderStats())
-	} else {
-		sections = append(sections, m.renderDiff())
+		sections = append(sections, m.renderStatsPanel())
 	}
 
 	// Status bar
@@ -157,7 +181,7 @@ func (m Model) View() string {
 
 // renderTitle renders the title bar
 func (m Model) renderTitle() string {
-	title := fmt.Sprintf("gdiff: %s ↔ %s", 
+	title := fmt.Sprintf("gdiff: %s ↔ %s",
 		truncate(m.diffResult.File1Name, 40),
 		truncate(m.diffResult.File2Name, 40))
 	return m.styles.title.Render(title)
@@ -165,32 +189,140 @@ func (m Model) renderTitle() string {
 
 // renderDiff renders the diff content
 func (m Model) renderDiff() string {
-	var lines []string
-	
 	// Calculate visible range
 	start := m.viewport.offset
 	end := min(start+m.viewport.height, len(m.diffResult.Lines))
-	
+
 	if start >= len(m.diffResult.Lines) {
 		start = max(0, len(m.diffResult.Lines)-m.viewport.height)
 		m.viewport.offset = start
 		end = len(m.diffResult.Lines)
 	}
 
-	// Render visible lines
+	if start >= end || len(m.diffResult.Lines) == 0 {
+		return m.styles.unchanged.Render("No differences found.")
+	}
+
+	// Render based on mode
+	if m.sideBySideMode {
+		return m.renderSideBySide(start, end)
+	}
+	return m.renderUnified(start, end)
+}
+
+// renderUnified renders the diff in unified mode (traditional view)
+func (m Model) renderUnified(start, end int) string {
+	var lines []string
+
 	for i := start; i < end; i++ {
 		line := m.diffResult.Lines[i]
 		lines = append(lines, m.renderLine(line))
 	}
 
-	if len(lines) == 0 {
-		return m.styles.unchanged.Render("No differences found.")
+	return strings.Join(lines, "\n")
+}
+
+// renderSideBySide renders the diff in side-by-side mode
+func (m Model) renderSideBySide(start, end int) string {
+	var lines []string
+
+	// Calculate column width (split screen in half, minus borders)
+	columnWidth := (m.width - 4) / 2
+	if columnWidth < 20 {
+		columnWidth = 20
+	}
+
+	// Render each line with left (file1) and right (file2) columns
+	for i := start; i < end; i++ {
+		line := m.diffResult.Lines[i]
+		leftContent, rightContent := m.renderSideBySideLine(line, columnWidth)
+
+		// Join left and right with separator
+		combinedLine := leftContent + " │ " + rightContent
+		lines = append(lines, combinedLine)
 	}
 
 	return strings.Join(lines, "\n")
 }
 
-// renderLine renders a single diff line
+// renderSideBySideLine renders a single line in side-by-side mode
+func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string, string) {
+	var leftParts, rightParts []string
+	var leftStyle, rightStyle lipgloss.Style
+
+	// Default styles
+	leftStyle = m.styles.unchanged
+	rightStyle = m.styles.unchanged
+
+	// Apply styles based on line type and syntax highlighting setting
+	if m.syntaxHighlight {
+		switch line.Type {
+		case diff.Removed:
+			leftStyle = m.styles.removed
+			rightStyle = m.styles.unchanged.Faint(true)
+		case diff.Added:
+			leftStyle = m.styles.unchanged.Faint(true)
+			rightStyle = m.styles.added
+		case diff.Equal:
+			leftStyle = m.styles.unchanged
+			rightStyle = m.styles.unchanged
+		}
+	} else {
+		// No syntax highlighting - use plain style
+		leftStyle = m.styles.unchanged
+		rightStyle = m.styles.unchanged
+	}
+
+	// Line numbers
+	if m.config.ShowLineNo {
+		lineNo1 := "     "
+		lineNo2 := "     "
+		if line.LineNo1 > 0 {
+			lineNo1 = fmt.Sprintf("%5d", line.LineNo1)
+		}
+		if line.LineNo2 > 0 {
+			lineNo2 = fmt.Sprintf("%5d", line.LineNo2)
+		}
+		leftParts = append(leftParts, m.styles.lineNumber.Render(lineNo1)+" ")
+		rightParts = append(rightParts, m.styles.lineNumber.Render(lineNo2)+" ")
+	}
+
+	// Content
+	leftContent := ""
+	rightContent := ""
+
+	switch line.Type {
+	case diff.Removed:
+		leftContent = "- " + line.Content
+		rightContent = ""
+	case diff.Added:
+		leftContent = ""
+		rightContent = "+ " + line.Content
+	case diff.Equal:
+		leftContent = "  " + line.Content
+		rightContent = "  " + line.Content
+	}
+
+	// Truncate content to fit column width
+	contentWidth := columnWidth - 8 // Account for line numbers
+	if len(leftContent) > contentWidth {
+		leftContent = leftContent[:contentWidth-3] + "..."
+	}
+	if len(rightContent) > contentWidth {
+		rightContent = rightContent[:contentWidth-3] + "..."
+	}
+
+	// Pad to column width
+	leftContent = fmt.Sprintf("%-*s", contentWidth, leftContent)
+	rightContent = fmt.Sprintf("%-*s", contentWidth, rightContent)
+
+	leftParts = append(leftParts, leftStyle.Render(leftContent))
+	rightParts = append(rightParts, rightStyle.Render(rightContent))
+
+	return strings.Join(leftParts, ""), strings.Join(rightParts, "")
+}
+
+// renderLine renders a single diff line in unified mode
 func (m Model) renderLine(line diff.DiffLine) string {
 	var parts []string
 
@@ -216,19 +348,35 @@ func (m Model) renderLine(line diff.DiffLine) string {
 	// Content with appropriate styling
 	var symbol string
 	var style lipgloss.Style
-	
-	switch line.Type {
-	case diff.Added:
-		symbol = "+"
-		style = m.styles.added
-	case diff.Removed:
-		symbol = "-"
-		style = m.styles.removed
-	case diff.Equal:
-		symbol = " "
-		style = m.styles.unchanged
-	default:
-		symbol = " "
+
+	// Apply syntax highlighting if enabled
+	if m.syntaxHighlight {
+		switch line.Type {
+		case diff.Added:
+			symbol = "+"
+			style = m.styles.added
+		case diff.Removed:
+			symbol = "-"
+			style = m.styles.removed
+		case diff.Equal:
+			symbol = " "
+			style = m.styles.unchanged
+		default:
+			symbol = " "
+			style = m.styles.unchanged
+		}
+	} else {
+		// No syntax highlighting - just show symbols
+		switch line.Type {
+		case diff.Added:
+			symbol = "+"
+		case diff.Removed:
+			symbol = "-"
+		case diff.Equal:
+			symbol = " "
+		default:
+			symbol = " "
+		}
 		style = m.styles.unchanged
 	}
 
@@ -241,73 +389,88 @@ func (m Model) renderLine(line diff.DiffLine) string {
 // renderStatusBar renders the status bar
 func (m Model) renderStatusBar() string {
 	added, removed, unchanged := m.diffResult.GetStats()
-	
+
+	// View mode indicator
+	viewMode := "unified"
+	if m.sideBySideMode {
+		viewMode = "side-by-side"
+	}
+
+	// Syntax highlighting indicator
+	syntaxMode := "on"
+	if !m.syntaxHighlight {
+		syntaxMode = "off"
+	}
+
 	status := fmt.Sprintf(
-		"Lines: +%d -%d =%d | Scroll: %d/%d | s:stats ?:help q:quit",
+		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Color: %s | v:view c:color s:stats ?:help q:quit",
 		added, removed, unchanged,
 		m.viewport.offset+1, len(m.diffResult.Lines),
+		viewMode, syntaxMode,
 	)
-	
+
 	return m.styles.statusBar.Width(m.width).Render(status)
 }
 
-// renderHelp renders the help screen
-func (m Model) renderHelp() string {
+// renderHelpPanel renders the help panel below the main view
+func (m Model) renderHelpPanel() string {
 	helpText := []string{
 		"",
 		"Keyboard Shortcuts:",
-		"",
-		"  j, ↓      Scroll down one line",
-		"  k, ↑      Scroll up one line",
-		"  d         Scroll down half page",
-		"  u         Scroll up half page",
-		"  g         Go to top",
-		"  G         Go to bottom",
-		"  s         Toggle statistics",
-		"  h, ?      Toggle help",
-		"  q, Ctrl+C Quit",
+		"  j, ↓      Scroll down     │  g         Go to top        │  v    Toggle side-by-side",
+		"  k, ↑      Scroll up       │  G         Go to bottom     │  c    Toggle syntax colors",
+		"  d         Half page down  │  s         Toggle stats     │  q    Quit",
+		"  u         Half page up    │  h, ?      Toggle help      │",
 		"",
 	}
-	
-	return m.styles.help.Render(strings.Join(helpText, "\n"))
+
+	// Create a bordered box for the help panel
+	helpStyle := m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2)
+
+	return helpStyle.Render(strings.Join(helpText, "\n"))
 }
 
-// renderStats renders the statistics screen
-func (m Model) renderStats() string {
+// renderStatsPanel renders the statistics panel below the main view
+func (m Model) renderStatsPanel() string {
 	added, removed, unchanged := m.diffResult.GetStats()
 	total := added + removed + unchanged
-	
+
 	addedPercent := 0.0
 	removedPercent := 0.0
 	unchangedPercent := 0.0
-	
+
 	if total > 0 {
 		addedPercent = float64(added) * 100.0 / float64(total)
 		removedPercent = float64(removed) * 100.0 / float64(total)
 		unchangedPercent = float64(unchanged) * 100.0 / float64(total)
 	}
-	
+
 	statsText := []string{
 		"",
 		"Diff Statistics",
 		"═══════════════",
+		fmt.Sprintf("File 1: %s  │  File 2: %s",
+			truncate(m.diffResult.File1Name, 35),
+			truncate(m.diffResult.File2Name, 35)),
 		"",
-		fmt.Sprintf("File 1: %s", m.diffResult.File1Name),
-		fmt.Sprintf("File 2: %s", m.diffResult.File2Name),
-		"",
-		fmt.Sprintf("Total lines:     %d", total),
-		fmt.Sprintf("Added lines:     %d (%.1f%%)", added, addedPercent),
-		fmt.Sprintf("Removed lines:   %d (%.1f%%)", removed, removedPercent),
-		fmt.Sprintf("Unchanged lines: %d (%.1f%%)", unchanged, unchangedPercent),
-		"",
-		fmt.Sprintf("Changes:         %d", added+removed),
-		fmt.Sprintf("Change ratio:    %.1f%%", (float64(added+removed)*100.0)/float64(total)),
-		"",
-		"Press 's' to return to diff view",
+		fmt.Sprintf("Total: %d lines  │  Added: %d (%.1f%%)  │  Removed: %d (%.1f%%)  │  Unchanged: %d (%.1f%%)",
+			total, added, addedPercent, removed, removedPercent, unchanged, unchangedPercent),
+		fmt.Sprintf("Changes: %d (%.1f%% of total)", added+removed, (float64(added+removed)*100.0)/float64(total)),
 		"",
 	}
-	
-	return m.styles.help.Render(strings.Join(statsText, "\n"))
+
+	// Create a bordered box for the stats panel
+	statsStyle := m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2)
+
+	return statsStyle.Render(strings.Join(statsText, "\n"))
 }
 
 // Scroll functions
@@ -353,6 +516,26 @@ func (m *Model) scrollToTop() {
 
 func (m *Model) scrollToBottom() {
 	m.viewport.offset = max(0, len(m.diffResult.Lines)-m.viewport.height)
+}
+
+// updateViewportHeight calculates and sets the viewport height based on screen size and active panels
+func (m *Model) updateViewportHeight() {
+	// Base height: total - title bar - status bar
+	baseHeight := m.height - 2
+
+	// Subtract panel height if help or stats is shown
+	if m.showHelp {
+		baseHeight -= m.helpPanelHeight
+	} else if m.showStats {
+		baseHeight -= m.statsPanelHeight
+	}
+
+	// Ensure minimum height
+	if baseHeight < 5 {
+		baseHeight = 5
+	}
+
+	m.viewport.height = baseHeight
 }
 
 // Utility functions

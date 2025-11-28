@@ -9,11 +9,12 @@
 
 - 🎨 **Beautiful TUI** - Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) and [Lip Gloss](https://github.com/charmbracelet/lipgloss)
 - 🔍 **Smart Diff** - Structural diffing with intelligent alignment
-- 🎯 **Side-by-Side View** - Clear visual representation of changes
+- 🎯 **Dual View Modes** - Toggle between unified and side-by-side views
 - ⌨️ **Vim-style Navigation** - Intuitive keyboard shortcuts
-- 🎨 **Syntax Highlighting** - Color-coded additions and deletions
+- 🎨 **Toggleable Syntax Highlighting** - Color-coded additions (green), deletions (red), and modifications (orange/yellow)
 - ⚙️ **Configurable** - Extensible architecture for customization
-- 📊 **Statistics** - Track additions, deletions, and unchanged lines
+- 📊 **Inline Statistics Panel** - Quick access to diff statistics without leaving the main view
+- 💡 **Contextual Help Panel** - In-place help display for easy reference
 
 ## Installation
 
@@ -83,16 +84,19 @@ gdiff -t 2 code1.go code2.go
 
 ## Keyboard Shortcuts
 
-| Key        | Action                  |
-|------------|------------------------|
-| `j` / `↓`  | Scroll down one line   |
-| `k` / `↑`  | Scroll up one line     |
-| `d`        | Scroll half page down  |
-| `u`        | Scroll half page up    |
-| `g`        | Go to top              |
-| `G`        | Go to bottom           |
-| `?` / `h`  | Toggle help            |
-| `q` / `^C` | Quit                   |
+| Key        | Action                          |
+|------------|---------------------------------|
+| `j` / `↓`  | Scroll down one line           |
+| `k` / `↑`  | Scroll up one line             |
+| `d`        | Scroll half page down          |
+| `u`        | Scroll half page up            |
+| `g`        | Go to top                      |
+| `G`        | Go to bottom                   |
+| `v`        | Toggle side-by-side view       |
+| `c`        | Toggle syntax highlighting     |
+| `s`        | Toggle statistics panel        |
+| `?` / `h`  | Toggle help panel              |
+| `q` / `^C` | Quit                           |
 
 ## Architecture
 
