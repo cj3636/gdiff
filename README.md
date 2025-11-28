@@ -22,6 +22,12 @@
 ```bash
 git clone https://github.com/cj3636/gdiff.git
 cd gdiff
+make build
+```
+
+Or manually:
+
+```bash
 go build -o gdiff .
 ```
 
@@ -29,6 +35,17 @@ go build -o gdiff .
 
 ```bash
 go install github.com/cj3636/gdiff@latest
+```
+
+### Using Make Targets
+
+```bash
+make help     # Show all available commands
+make build    # Build the application
+make install  # Install to $GOPATH/bin
+make clean    # Remove build artifacts
+make fmt      # Format code
+make test     # Run tests
 ```
 
 ## Usage
