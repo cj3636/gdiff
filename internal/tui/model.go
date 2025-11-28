@@ -19,6 +19,7 @@ type Model struct {
 	width      int
 	height     int
 	showHelp   bool
+	showStats  bool
 	err        error
 }
 
@@ -99,6 +100,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "?", "h":
 			m.showHelp = !m.showHelp
+		case "s":
+			m.showStats = !m.showStats
 		case "j", "down":
 			m.scrollDown()
 		case "k", "up":
@@ -140,6 +143,8 @@ func (m Model) View() string {
 	// Main content
 	if m.showHelp {
 		sections = append(sections, m.renderHelp())
+	} else if m.showStats {
+		sections = append(sections, m.renderStats())
 	} else {
 		sections = append(sections, m.renderDiff())
 	}
@@ -238,7 +243,7 @@ func (m Model) renderStatusBar() string {
 	added, removed, unchanged := m.diffResult.GetStats()
 	
 	status := fmt.Sprintf(
-		"Lines: +%d -%d =%d | Scroll: %d/%d | Press ? for help",
+		"Lines: +%d -%d =%d | Scroll: %d/%d | s:stats ?:help q:quit",
 		added, removed, unchanged,
 		m.viewport.offset+1, len(m.diffResult.Lines),
 	)
@@ -258,6 +263,7 @@ func (m Model) renderHelp() string {
 		"  u         Scroll up half page",
 		"  g         Go to top",
 		"  G         Go to bottom",
+		"  s         Toggle statistics",
 		"  h, ?      Toggle help",
 		"  q, Ctrl+C Quit",
 		"",
@@ -266,9 +272,48 @@ func (m Model) renderHelp() string {
 	return m.styles.help.Render(strings.Join(helpText, "\n"))
 }
 
+// renderStats renders the statistics screen
+func (m Model) renderStats() string {
+	added, removed, unchanged := m.diffResult.GetStats()
+	total := added + removed + unchanged
+	
+	addedPercent := 0.0
+	removedPercent := 0.0
+	unchangedPercent := 0.0
+	
+	if total > 0 {
+		addedPercent = float64(added) * 100.0 / float64(total)
+		removedPercent = float64(removed) * 100.0 / float64(total)
+		unchangedPercent = float64(unchanged) * 100.0 / float64(total)
+	}
+	
+	statsText := []string{
+		"",
+		"Diff Statistics",
+		"═══════════════",
+		"",
+		fmt.Sprintf("File 1: %s", m.diffResult.File1Name),
+		fmt.Sprintf("File 2: %s", m.diffResult.File2Name),
+		"",
+		fmt.Sprintf("Total lines:     %d", total),
+		fmt.Sprintf("Added lines:     %d (%.1f%%)", added, addedPercent),
+		fmt.Sprintf("Removed lines:   %d (%.1f%%)", removed, removedPercent),
+		fmt.Sprintf("Unchanged lines: %d (%.1f%%)", unchanged, unchangedPercent),
+		"",
+		fmt.Sprintf("Changes:         %d", added+removed),
+		fmt.Sprintf("Change ratio:    %.1f%%", (float64(added+removed)*100.0)/float64(total)),
+		"",
+		"Press 's' to return to diff view",
+		"",
+	}
+	
+	return m.styles.help.Render(strings.Join(statsText, "\n"))
+}
+
 // Scroll functions
 func (m *Model) scrollDown() {
-	if m.viewport.offset < len(m.diffResult.Lines)-m.viewport.height {
+	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	if m.viewport.offset < maxOffset {
 		m.viewport.offset++
 	}
 }
@@ -280,14 +325,23 @@ func (m *Model) scrollUp() {
 }
 
 func (m *Model) scrollPageDown() {
-	m.viewport.offset += m.viewport.height / 2
-	if m.viewport.offset > len(m.diffResult.Lines)-m.viewport.height {
-		m.viewport.offset = max(0, len(m.diffResult.Lines)-m.viewport.height)
+	halfPage := m.viewport.height / 2
+	if halfPage < 1 {
+		halfPage = 1
+	}
+	m.viewport.offset += halfPage
+	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	if m.viewport.offset > maxOffset {
+		m.viewport.offset = maxOffset
 	}
 }
 
 func (m *Model) scrollPageUp() {
-	m.viewport.offset -= m.viewport.height / 2
+	halfPage := m.viewport.height / 2
+	if halfPage < 1 {
+		halfPage = 1
+	}
+	m.viewport.offset -= halfPage
 	if m.viewport.offset < 0 {
 		m.viewport.offset = 0
 	}

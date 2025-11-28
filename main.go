@@ -12,15 +12,17 @@ import (
 )
 
 var (
-	showVersion  bool
-	noLineNumber bool
-	tabSize      int
-	help         bool
+	showVersion      bool
+	noLineNumber     bool
+	ignoreWhitespace bool
+	tabSize          int
+	help             bool
 )
 
 func init() {
 	flag.BoolVarP(&showVersion, "version", "v", false, "Show version information")
 	flag.BoolVarP(&noLineNumber, "no-line-numbers", "n", false, "Hide line numbers")
+	flag.BoolVarP(&ignoreWhitespace, "ignore-whitespace", "w", false, "Ignore whitespace changes")
 	flag.IntVarP(&tabSize, "tab-size", "t", 4, "Set tab size")
 	flag.BoolVarP(&help, "help", "h", false, "Show help information")
 	flag.Usage = usage
@@ -88,6 +90,7 @@ func main() {
 	cfg := config.DefaultConfig()
 	cfg.ShowLineNo = !noLineNumber
 	cfg.TabSize = tabSize
+	cfg.IgnoreWhitespace = ignoreWhitespace
 
 	// Create diff engine and compute diff
 	engine := diff.NewEngine()

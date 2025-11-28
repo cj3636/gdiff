@@ -22,7 +22,6 @@ const (
 	Equal LineType = iota
 	Added
 	Removed
-	Changed
 )
 
 // DiffResult contains the results of a diff operation

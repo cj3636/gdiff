@@ -6,10 +6,11 @@ import (
 
 // Config holds the application configuration
 type Config struct {
-	Theme      Theme
-	DiffMode   DiffMode
-	ShowLineNo bool
-	TabSize    int
+	Theme            Theme
+	DiffMode         DiffMode
+	ShowLineNo       bool
+	TabSize          int
+	IgnoreWhitespace bool
 }
 
 // Theme defines the color scheme for the application
@@ -38,10 +39,11 @@ const (
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Theme:      DefaultTheme(),
-		DiffMode:   SideBySide,
-		ShowLineNo: true,
-		TabSize:    4,
+		Theme:            DefaultTheme(),
+		DiffMode:         SideBySide,
+		ShowLineNo:       true,
+		TabSize:          4,
+		IgnoreWhitespace: false,
 	}
 }
 
