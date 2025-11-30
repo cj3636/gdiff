@@ -2,6 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,6 +17,7 @@ import (
 type Model struct {
 	diffResult       *diff.DiffResult
 	config           *config.Config
+	diffEngine       *diff.Engine
 	styles           *Styles
 	viewport         Viewport
 	width            int
@@ -22,10 +26,25 @@ type Model struct {
 	showStats        bool
 	sideBySideMode   bool
 	syntaxHighlight  bool
+	showBlame        bool
 	err              error
 	helpPanelHeight  int
 	statsPanelHeight int
+	activePanel      panelType
+	gitCtx           GitContext
+	branchIndex      int
 }
+
+type panelType int
+
+const (
+	noPanel panelType = iota
+	helpPanel
+	statsPanel
+	statusPanel
+	branchPanel
+	historyPanel
+)
 
 // Viewport controls the visible portion of the diff
 type Viewport struct {
@@ -43,23 +62,37 @@ type Styles struct {
 	title      lipgloss.Style
 	help       lipgloss.Style
 	statusBar  lipgloss.Style
+	blame      lipgloss.Style
 }
 
 // NewModel creates a new TUI model
-func NewModel(diffResult *diff.DiffResult, cfg *config.Config) Model {
+func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engine, gitCtx GitContext) Model {
 	styles := createStyles(cfg.Theme)
-	return Model{
+	model := Model{
 		diffResult:       diffResult,
 		config:           cfg,
+		diffEngine:       engine,
 		styles:           styles,
 		viewport:         Viewport{offset: 0, height: 20},
 		showHelp:         false,
 		showStats:        false,
 		sideBySideMode:   false,
 		syntaxHighlight:  true, // Default to enabled
+		showBlame:        gitCtx.ShowBlame,
 		helpPanelHeight:  12,
 		statsPanelHeight: 17,
+		gitCtx:           gitCtx,
 	}
+
+	if gitCtx.Enabled {
+		for i, b := range gitCtx.Branches {
+			if b == gitCtx.Ref2 {
+				model.branchIndex = i
+				break
+			}
+		}
+	}
+	return model
 }
 
 // createStyles initializes all lipgloss styles based on theme
@@ -92,6 +125,9 @@ func createStyles(theme config.Theme) *Styles {
 			Foreground(theme.TitleFg).
 			Background(theme.TitleBg).
 			Padding(0, 1),
+		blame: lipgloss.NewStyle().
+			Foreground(theme.HelpFg).
+			Faint(true),
 	}
 }
 
@@ -108,23 +144,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case "?", "h":
-			m.showHelp = !m.showHelp
-			// Close stats if opening help
-			if m.showHelp {
-				m.showStats = false
-			}
-			m.updateViewportHeight()
+			m.togglePanel(helpPanel)
 		case "s":
-			m.showStats = !m.showStats
-			// Close help if opening stats
-			if m.showStats {
-				m.showHelp = false
-			}
-			m.updateViewportHeight()
+			m.togglePanel(statsPanel)
+		case "S":
+			m.togglePanel(statusPanel)
+		case "B":
+			m.togglePanel(branchPanel)
+		case "H":
+			m.togglePanel(historyPanel)
 		case "v":
 			m.sideBySideMode = !m.sideBySideMode
 		case "c":
 			m.syntaxHighlight = !m.syntaxHighlight
+		case "b":
+			m.showBlame = !m.showBlame
+			if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
+				m.gitCtx.Blame, m.err = m.collectBlame()
+			}
 		case "j", "down":
 			m.scrollDown()
 		case "k", "up":
@@ -137,6 +174,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scrollToTop()
 		case "G":
 			m.scrollToBottom()
+		case "[":
+			m.selectPreviousBranch()
+		case "]":
+			m.selectNextBranch()
 		}
 
 	case tea.WindowSizeMsg:
@@ -167,10 +208,8 @@ func (m Model) View() string {
 	sections = append(sections, m.renderDiff())
 
 	// Bottom panel (help or stats) - shown below main view if toggled
-	if m.showHelp {
-		sections = append(sections, m.renderHelpPanel())
-	} else if m.showStats {
-		sections = append(sections, m.renderStatsPanel())
+	if m.activePanel != noPanel {
+		sections = append(sections, m.renderActivePanel())
 	}
 
 	// Status bar
@@ -184,6 +223,12 @@ func (m Model) renderTitle() string {
 	title := fmt.Sprintf("gdiff: %s ↔ %s",
 		truncate(m.diffResult.File1Name, 40),
 		truncate(m.diffResult.File2Name, 40))
+
+	if m.gitCtx.Enabled {
+		title = fmt.Sprintf("gdiff: %s (%s) ↔ %s (%s)",
+			truncate(m.diffResult.File1Name, 25), m.gitCtx.Ref1,
+			truncate(m.diffResult.File2Name, 25), m.gitCtx.Ref2)
+	}
 	return m.styles.title.Render(title)
 }
 
@@ -239,6 +284,11 @@ func (m Model) renderSideBySide(start, end int) string {
 
 		// Join left and right with separator
 		combinedLine := leftContent + " │ " + rightContent
+		if m.showBlame && m.gitCtx.Enabled {
+			if blameText, ok := m.gitCtx.Blame[line.LineNo2]; ok && blameText != "" {
+				combinedLine += "  " + m.styles.blame.Render(truncate(blameText, 60))
+			}
+		}
 		lines = append(lines, combinedLine)
 	}
 
@@ -406,6 +456,12 @@ func (m Model) renderLine(line diff.DiffLine) string {
 	content := symbol + " " + line.Content
 	parts = append(parts, style.Render(content))
 
+	if m.showBlame && m.gitCtx.Enabled {
+		if blameText, ok := m.gitCtx.Blame[line.LineNo2]; ok && blameText != "" {
+			parts = append(parts, "  "+m.styles.blame.Render(truncate(blameText, 60)))
+		}
+	}
+
 	return strings.Join(parts, "")
 }
 
@@ -425,14 +481,36 @@ func (m Model) renderStatusBar() string {
 		syntaxMode = "off"
 	}
 
+	gitInfo := ""
+	if m.gitCtx.Enabled {
+		gitInfo = fmt.Sprintf(" | git: %s→%s", m.gitCtx.Ref1, m.gitCtx.Ref2)
+	}
+
 	status := fmt.Sprintf(
-		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Color: %s | v:view c:color s:stats ?:help q:quit",
+		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Color: %s%s | v:view c:color s:stats ?:help q:quit",
 		added, removed, unchanged,
 		m.viewport.offset+1, len(m.diffResult.Lines),
-		viewMode, syntaxMode,
+		viewMode, syntaxMode, gitInfo,
 	)
 
 	return m.styles.statusBar.Width(m.width).Render(status)
+}
+
+func (m Model) renderActivePanel() string {
+	switch m.activePanel {
+	case helpPanel:
+		return m.renderHelpPanel()
+	case statsPanel:
+		return m.renderStatsPanel()
+	case statusPanel:
+		return m.renderGitStatusPanel()
+	case branchPanel:
+		return m.renderBranchesPanel()
+	case historyPanel:
+		return m.renderHistoryPanel()
+	default:
+		return ""
+	}
 }
 
 // renderHelpPanel renders the help panel below the main view
@@ -442,8 +520,10 @@ func (m Model) renderHelpPanel() string {
 		"Keyboard Shortcuts:",
 		"  j, ↓      Scroll down     │  g         Go to top        │  v    Toggle side-by-side",
 		"  k, ↑      Scroll up       │  G         Go to bottom     │  c    Toggle syntax colors",
-		"  d         Half page down  │  s         Toggle stats     │  q    Quit",
-		"  u         Half page up    │  h, ?      Toggle help      │",
+		"  d         Half page down  │  s         Toggle stats     │  b    Toggle blame",
+		"  u         Half page up    │  h, ?      Toggle help      │  q    Quit",
+		"  S         Git status      │  B         Branch switcher  │  H    Commit history",
+		"  [ / ]     Cycle branches  │",
 		"",
 	}
 
@@ -498,6 +578,67 @@ func (m Model) renderStatsPanel() string {
 	return statsStyle.Render(strings.Join(statsText, "\n"))
 }
 
+func (m Model) renderGitStatusPanel() string {
+	if !m.gitCtx.Enabled {
+		return m.styles.help.Render("Git repository not detected - status unavailable")
+	}
+
+	if len(m.gitCtx.Status) == 0 {
+		return m.styles.help.Render("Working tree clean")
+	}
+
+	content := append([]string{"Git Status", "─────────"}, m.gitCtx.Status...)
+	return m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2).
+		Render(strings.Join(content, "\n"))
+}
+
+func (m Model) renderBranchesPanel() string {
+	if !m.gitCtx.Enabled {
+		return m.styles.help.Render("Git repository not detected - branches unavailable")
+	}
+
+	lines := []string{"Branches", "────────"}
+
+	for i, br := range m.gitCtx.Branches {
+		marker := " "
+		if br == m.gitCtx.CurrentBranch {
+			marker = "*"
+		}
+		selector := " "
+		if i == m.branchIndex {
+			selector = ">"
+		}
+		lines = append(lines, fmt.Sprintf("%s%s %s", selector, marker, br))
+	}
+
+	return m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2).
+		Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) renderHistoryPanel() string {
+	if !m.gitCtx.Enabled {
+		return m.styles.help.Render("Git repository not detected - history unavailable")
+	}
+
+	lines := []string{"Recent Commits", "────────────"}
+	lines = append(lines, m.gitCtx.CommitHistory...)
+
+	return m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2).
+		Render(strings.Join(lines, "\n"))
+}
+
 // Scroll functions
 func (m *Model) scrollDown() {
 	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
@@ -543,15 +684,126 @@ func (m *Model) scrollToBottom() {
 	m.viewport.offset = max(0, len(m.diffResult.Lines)-m.viewport.height)
 }
 
+func (m *Model) togglePanel(target panelType) {
+	if m.activePanel == target {
+		m.activePanel = noPanel
+	} else {
+		m.activePanel = target
+	}
+
+	m.showHelp = m.activePanel == helpPanel
+	m.showStats = m.activePanel == statsPanel
+	m.updateViewportHeight()
+}
+
+func (m *Model) selectNextBranch() {
+	if !m.gitCtx.Enabled || len(m.gitCtx.Branches) == 0 {
+		return
+	}
+	m.branchIndex = (m.branchIndex + 1) % len(m.gitCtx.Branches)
+	m.gitCtx.Ref2 = m.gitCtx.Branches[m.branchIndex]
+	m.reloadDiff()
+}
+
+func (m *Model) selectPreviousBranch() {
+	if !m.gitCtx.Enabled || len(m.gitCtx.Branches) == 0 {
+		return
+	}
+	m.branchIndex--
+	if m.branchIndex < 0 {
+		m.branchIndex = len(m.gitCtx.Branches) - 1
+	}
+	m.gitCtx.Ref2 = m.gitCtx.Branches[m.branchIndex]
+	m.reloadDiff()
+}
+
+func (m *Model) reloadDiff() {
+	if m.diffEngine == nil || !m.gitCtx.Enabled {
+		return
+	}
+
+	lines1, err := m.readLinesForRef(m.gitCtx.Ref1)
+	if err != nil {
+		m.err = err
+		return
+	}
+	lines2, err := m.readLinesForRef(m.gitCtx.Ref2)
+	if err != nil {
+		m.err = err
+		return
+	}
+
+	leftLabel := fmt.Sprintf("%s:%s", m.gitCtx.Ref1, m.gitCtx.FilePath)
+	rightLabel := fmt.Sprintf("%s:%s", m.gitCtx.Ref2, m.gitCtx.FilePath)
+
+	m.diffResult = m.diffEngine.DiffLines(lines1, lines2, leftLabel, rightLabel)
+	if m.showBlame {
+		m.gitCtx.Blame, _ = m.collectBlame()
+	}
+}
+
+func (m *Model) readLinesForRef(ref string) ([]string, error) {
+	if ref == "" || ref == "WORKTREE" {
+		data, err := os.ReadFile(filepath.Join(m.gitCtx.RepoRoot, m.gitCtx.FilePath))
+		if err != nil {
+			return nil, err
+		}
+		text := strings.TrimSuffix(string(data), "\n")
+		if text == "" {
+			return []string{}, nil
+		}
+		return strings.Split(text, "\n"), nil
+	}
+
+	cmd := exec.Command("git", "-C", m.gitCtx.RepoRoot, "show", fmt.Sprintf("%s:%s", ref, m.gitCtx.FilePath))
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	text := strings.TrimSuffix(string(out), "\n")
+	if text == "" {
+		return []string{}, nil
+	}
+
+	return strings.Split(text, "\n"), nil
+}
+
+func (m *Model) collectBlame() (map[int]string, error) {
+	blame := make(map[int]string)
+	if !m.gitCtx.Enabled {
+		return blame, nil
+	}
+
+	target := m.gitCtx.FilePath
+	if m.gitCtx.Ref2 != "" && m.gitCtx.Ref2 != "WORKTREE" {
+		target = fmt.Sprintf("%s:%s", m.gitCtx.Ref2, m.gitCtx.FilePath)
+	}
+
+	cmd := exec.Command("git", "-C", m.gitCtx.RepoRoot, "blame", "-l", target)
+	out, err := cmd.Output()
+	if err != nil {
+		return blame, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for i, line := range lines {
+		blame[i+1] = line
+	}
+
+	return blame, nil
+}
+
 // updateViewportHeight calculates and sets the viewport height based on screen size and active panels
 func (m *Model) updateViewportHeight() {
 	// Base height: total - title bar - status bar
 	baseHeight := m.height - 2
 
 	// Subtract panel height if help or stats is shown
-	if m.showHelp {
+	switch m.activePanel {
+	case helpPanel:
 		baseHeight -= m.helpPanelHeight
-	} else if m.showStats {
+	case statsPanel, statusPanel, branchPanel, historyPanel:
 		baseHeight -= m.statsPanelHeight
 	}
 
