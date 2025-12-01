@@ -41,6 +41,10 @@ type Model struct {
 	goToLineActive   bool
 	goToLineValue    string
 	goToLineError    string
+	wrapLines        bool
+	minimapWidth     int
+	minimapStartCol  int
+	minimapHeight    int
 }
 
 type paletteEntry struct {
@@ -60,6 +64,7 @@ const (
 	paletteActionToggleSideBySide
 	paletteActionToggleSyntax
 	paletteActionToggleBlame
+	paletteActionToggleWrap
 	paletteActionGoTop
 	paletteActionGoBottom
 	paletteActionGoToLine
@@ -96,6 +101,8 @@ type Styles struct {
 	blame      lipgloss.Style
 	selection  lipgloss.Style
 	section    lipgloss.Style
+	minimapAdd lipgloss.Style
+	minimapDel lipgloss.Style
 }
 
 // NewModel creates a new TUI model
@@ -117,6 +124,8 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 		statsPanelHeight: 17,
 		commandHeight:    16,
 		gitCtx:           gitCtx,
+		wrapLines:        false,
+		minimapWidth:     14,
 	}
 
 	if gitCtx.Enabled {
@@ -172,6 +181,8 @@ func createStyles(theme config.Theme) *Styles {
 		section: lipgloss.NewStyle().
 			Foreground(theme.TitleFg).
 			Bold(true),
+		minimapAdd: lipgloss.NewStyle().Foreground(theme.AddedFg),
+		minimapDel: lipgloss.NewStyle().Foreground(theme.RemovedFg),
 	}
 }
 
@@ -213,11 +224,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sideBySideMode = !m.sideBySideMode
 		case "c":
 			m.syntaxHighlight = !m.syntaxHighlight
+		case "w":
+			m.wrapLines = !m.wrapLines
 		case "b":
 			m.showBlame = !m.showBlame
 			if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
 				m.gitCtx.Blame, m.err = m.collectBlame()
 			}
+		case "<":
+			m.adjustMinimapWidth(-2)
+		case ">":
+			m.adjustMinimapWidth(2)
+		case "n":
+			m.jumpToNextChange()
+		case "N":
+			m.jumpToPreviousChange()
 		case "j", "down":
 			m.scrollDown()
 		case "k", "up":
@@ -242,6 +263,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.updateViewportHeight()
+	case tea.MouseMsg:
+		m.handleMouse(msg)
 	}
 
 	return m, nil
@@ -314,51 +337,344 @@ func (m Model) renderDiff() string {
 		return m.styles.unchanged.Render("No differences found.")
 	}
 
-	// Render based on mode
+	contentWidth := m.availableContentWidth()
+	var lines []string
 	if m.sideBySideMode {
-		return m.renderSideBySide(start, end)
+		lines = m.renderSideBySideLines(start, end, contentWidth)
+	} else {
+		lines = m.renderUnifiedLines(start, end, contentWidth)
 	}
-	return m.renderUnified(start, end)
+
+	lines = m.padLines(lines, m.viewport.height)
+	mainView := lipgloss.NewStyle().Width(contentWidth).Render(strings.Join(lines, "\n"))
+	minimap := m.renderMinimap()
+	return lipgloss.JoinHorizontal(lipgloss.Top, mainView, minimap)
 }
 
-// renderUnified renders the diff in unified mode (traditional view)
-func (m Model) renderUnified(start, end int) string {
+func (m *Model) availableContentWidth() int {
+	width := m.width - m.minimapWidth
+	if width < 20 {
+		width = 20
+	}
+	m.minimapStartCol = width + 1
+	m.minimapHeight = m.viewport.height
+	return width
+}
+
+func (m Model) renderUnifiedLines(start, end, contentWidth int) []string {
 	var lines []string
 
 	for i := start; i < end; i++ {
-		line := m.diffResult.Lines[i]
-		lines = append(lines, m.renderLine(line))
+		prefix, style, content := m.buildUnifiedLineParts(m.diffResult.Lines[i])
+		available := contentWidth - lipgloss.Width(prefix)
+		if available < 10 {
+			available = 10
+		}
+
+		wrapped := []string{content}
+		if m.wrapLines {
+			wrapped = wrapText(content, available)
+		}
+
+		for _, part := range wrapped {
+			trimmed := truncateWidth(part, available)
+			lines = append(lines, prefix+style.Render(trimmed))
+		}
 	}
 
-	return strings.Join(lines, "\n")
+	return lines
 }
 
-// renderSideBySide renders the diff in side-by-side mode
-func (m Model) renderSideBySide(start, end int) string {
+func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
 	var lines []string
 
-	// Calculate column width (split screen in half, minus borders)
-	columnWidth := (m.width - 4) / 2
+	columnWidth := (contentWidth - 3) / 2
 	if columnWidth < 20 {
 		columnWidth = 20
 	}
 
-	// Render each line with left (file1) and right (file2) columns
 	for i := start; i < end; i++ {
 		line := m.diffResult.Lines[i]
 		leftContent, rightContent := m.renderSideBySideLine(line, columnWidth)
-
-		// Join left and right with separator
 		combinedLine := leftContent + " │ " + rightContent
 		if m.showBlame && m.gitCtx.Enabled {
 			if blameText, ok := m.gitCtx.Blame[line.LineNo2]; ok && blameText != "" {
 				combinedLine += "  " + m.styles.blame.Render(truncate(blameText, 60))
 			}
 		}
-		lines = append(lines, combinedLine)
+
+		lines = append(lines, truncateWidth(combinedLine, contentWidth))
 	}
 
-	return strings.Join(lines, "\n")
+	return lines
+}
+
+func (m Model) padLines(lines []string, target int) []string {
+	for len(lines) < target {
+		lines = append(lines, "")
+	}
+	return lines
+}
+
+func (m Model) renderMinimap() string {
+	height := m.viewport.height
+	if height < 1 {
+		height = 1
+	}
+	m.minimapHeight = height
+
+	width := m.minimapWidth
+	if width < 6 {
+		width = 6
+	}
+
+	total := len(m.diffResult.Lines)
+	if total == 0 {
+		return ""
+	}
+
+	type bucket struct {
+		added   int
+		removed int
+		equal   int
+	}
+
+	buckets := make([]bucket, height)
+	for idx, line := range m.diffResult.Lines {
+		row := int(float64(idx) / float64(max(total, 1)) * float64(height))
+		if row >= height {
+			row = height - 1
+		}
+		switch line.Type {
+		case diff.Added:
+			buckets[row].added++
+		case diff.Removed:
+			buckets[row].removed++
+		default:
+			buckets[row].equal++
+		}
+	}
+
+	viewStart := int(float64(m.viewport.offset) / float64(max(total, 1)) * float64(height))
+	viewEnd := int(float64(min(m.viewport.offset+m.viewport.height, total)) / float64(max(total, 1)) * float64(height))
+	if viewEnd >= height {
+		viewEnd = height - 1
+	}
+
+	divider := m.styles.border.Render("│")
+	var rows []string
+	for i := 0; i < height; i++ {
+		bucket := buckets[i]
+		indicator := strings.Repeat("▐", width-1)
+
+		style := m.styles.unchanged
+		switch {
+		case bucket.added >= bucket.removed && bucket.added > bucket.equal:
+			style = m.styles.minimapAdd
+		case bucket.removed > bucket.added && bucket.removed > bucket.equal:
+			style = m.styles.minimapDel
+		}
+
+		if i >= viewStart && i <= viewEnd {
+			style = m.styles.selection
+		}
+
+		rows = append(rows, divider+style.Width(width-1).Render(indicator))
+	}
+
+	return strings.Join(rows, "\n")
+}
+
+func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style, string) {
+	var parts []string
+
+	if m.config.ShowLineNo {
+		lineNo1 := " "
+		lineNo2 := " "
+		if line.LineNo1 > 0 {
+			lineNo1 = fmt.Sprintf("%5d", line.LineNo1)
+		} else {
+			lineNo1 = "     "
+		}
+		if line.LineNo2 > 0 {
+			lineNo2 = fmt.Sprintf("%5d", line.LineNo2)
+		} else {
+			lineNo2 = "     "
+		}
+		parts = append(parts, m.styles.lineNumber.Render(lineNo1))
+		parts = append(parts, m.styles.lineNumber.Render(lineNo2))
+		parts = append(parts, " ")
+	}
+
+	var symbol string
+	var style lipgloss.Style
+
+	if m.syntaxHighlight {
+		switch line.Type {
+		case diff.Added:
+			symbol = "+"
+			style = m.styles.added
+		case diff.Removed:
+			symbol = "-"
+			style = m.styles.removed
+		case diff.Equal:
+			symbol = " "
+			style = m.styles.unchanged
+		default:
+			symbol = " "
+			style = m.styles.unchanged
+		}
+	} else {
+		switch line.Type {
+		case diff.Added:
+			symbol = "+"
+		case diff.Removed:
+			symbol = "-"
+		case diff.Equal:
+			symbol = " "
+		default:
+			symbol = " "
+		}
+		style = m.styles.unchanged
+	}
+
+	content := symbol + " " + line.Content
+	return strings.Join(parts, ""), style, content
+}
+
+func wrapText(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+
+	var lines []string
+	var builder strings.Builder
+	currentWidth := 0
+	for _, r := range text {
+		runeWidth := lipgloss.Width(string(r))
+		if currentWidth+runeWidth > width {
+			lines = append(lines, builder.String())
+			builder.Reset()
+			currentWidth = 0
+		}
+		builder.WriteRune(r)
+		currentWidth += runeWidth
+	}
+
+	if builder.Len() > 0 {
+		lines = append(lines, builder.String())
+	}
+
+	if len(lines) == 0 {
+		return []string{""}
+	}
+
+	return lines
+}
+
+func truncateWidth(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+
+	if lipgloss.Width(text) <= width {
+		return text
+	}
+
+	var builder strings.Builder
+	current := 0
+	for _, r := range text {
+		runeWidth := lipgloss.Width(string(r))
+		if current+runeWidth > width-3 {
+			break
+		}
+		builder.WriteRune(r)
+		current += runeWidth
+	}
+
+	return builder.String() + "..."
+}
+
+func (m *Model) adjustMinimapWidth(delta int) {
+	m.minimapWidth += delta
+	if m.minimapWidth < 6 {
+		m.minimapWidth = 6
+	}
+	maxWidth := m.width / 3
+	if maxWidth < 10 {
+		maxWidth = 10
+	}
+	if m.minimapWidth > maxWidth {
+		m.minimapWidth = maxWidth
+	}
+}
+
+func (m *Model) lineForMinimapRow(row int) int {
+	total := len(m.diffResult.Lines)
+	if total == 0 {
+		return 0
+	}
+
+	if row < 0 {
+		row = 0
+	}
+	if row >= m.minimapHeight {
+		row = m.minimapHeight - 1
+	}
+
+	fraction := float64(row) / float64(max(m.minimapHeight, 1))
+	line := int(fraction * float64(total))
+	if line >= total {
+		line = total - 1
+	}
+	return line
+}
+
+func (m *Model) handleMouse(msg tea.MouseMsg) {
+	if msg.Action != tea.MouseActionPress && msg.Action != tea.MouseActionRelease {
+		return
+	}
+
+	if m.minimapStartCol == 0 || msg.X < m.minimapStartCol {
+		return
+	}
+
+	mapTop := 2 // Title occupies first line
+	if msg.Y < mapTop || msg.Y >= mapTop+m.minimapHeight {
+		return
+	}
+
+	targetRow := msg.Y - mapTop
+	line := m.lineForMinimapRow(targetRow)
+	m.jumpToOffset(line)
+}
+
+func (m *Model) jumpToNextChange() {
+	changes := m.changeOffsets()
+	for _, off := range changes {
+		if off > m.viewport.offset {
+			m.jumpToOffset(off)
+			return
+		}
+	}
+
+	if len(changes) > 0 {
+		m.jumpToOffset(changes[0])
+	}
+}
+
+func (m *Model) jumpToPreviousChange() {
+	changes := m.changeOffsets()
+	for i := len(changes) - 1; i >= 0; i-- {
+		if changes[i] < m.viewport.offset {
+			m.jumpToOffset(changes[i])
+			return
+		}
+	}
+
+	if len(changes) > 0 {
+		m.jumpToOffset(changes[len(changes)-1])
+	}
 }
 
 // renderSideBySideLine renders a single line in side-by-side mode
@@ -547,16 +863,21 @@ func (m Model) renderStatusBar() string {
 		syntaxMode = "off"
 	}
 
+	wrapMode := "off"
+	if m.wrapLines {
+		wrapMode = "on"
+	}
+
 	gitInfo := ""
 	if m.gitCtx.Enabled {
 		gitInfo = fmt.Sprintf(" | git: %s→%s", m.gitCtx.Ref1, m.gitCtx.Ref2)
 	}
 
 	status := fmt.Sprintf(
-		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Color: %s%s | v:view c:color s:stats ?:help q:quit",
+		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Wrap: %s | Color: %s%s | v:view c:color w:wrap <:map- >:map+ n/N:changes s:stats ?:help q:quit",
 		added, removed, unchanged,
 		m.viewport.offset+1, len(m.diffResult.Lines),
-		viewMode, syntaxMode, gitInfo,
+		viewMode, wrapMode, syntaxMode, gitInfo,
 	)
 
 	return m.styles.statusBar.Width(m.width).Render(status)
@@ -587,10 +908,11 @@ func (m Model) renderHelpPanel() string {
 		"  j, ↓      Scroll down     │  g         Go to top        │  v    Toggle side-by-side",
 		"  k, ↑      Scroll up       │  G         Go to bottom     │  c    Toggle syntax colors",
 		"  d         Half page down  │  s         Toggle stats     │  b    Toggle blame",
-		"  u         Half page up    │  h, ?      Toggle help      │  q    Quit",
+		"  u         Half page up    │  w         Toggle wrapping  │  q    Quit",
 		"  p         Command palette │  L         Go to line       │  g↵   Palette go-to-line",
 		"  S         Git status      │  B         Branch switcher  │  H    Commit history",
-		"  [ / ]     Cycle branches  │",
+		"  [ / ]     Cycle branches  │  < / >     Resize minimap",
+		"  n / N     Next/prev change│  Mouse     Jump via minimap",
 		"",
 	}
 
@@ -809,6 +1131,8 @@ func (m *Model) executePaletteSelection() {
 		if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
 			m.gitCtx.Blame, m.err = m.collectBlame()
 		}
+	case paletteActionToggleWrap:
+		m.wrapLines = !m.wrapLines
 	case paletteActionGoTop:
 		m.scrollToTop()
 	case paletteActionGoBottom:
@@ -834,6 +1158,7 @@ func (m *Model) refreshPaletteEntries() {
 		paletteEntry{section: "Commands", label: "Toggle stats", description: "s", action: paletteActionToggleStats},
 		paletteEntry{section: "Commands", label: "Toggle side-by-side", description: "v", action: paletteActionToggleSideBySide},
 		paletteEntry{section: "Commands", label: "Toggle syntax colors", description: "c", action: paletteActionToggleSyntax},
+		paletteEntry{section: "Commands", label: "Toggle wrapping", description: "w", action: paletteActionToggleWrap},
 		paletteEntry{section: "Commands", label: "Toggle blame", description: "b", action: paletteActionToggleBlame},
 		paletteEntry{section: "Commands", label: "Go to top", description: "g", action: paletteActionGoTop},
 		paletteEntry{section: "Commands", label: "Go to bottom", description: "G", action: paletteActionGoBottom},
