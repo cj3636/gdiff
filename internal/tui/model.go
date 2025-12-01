@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -24,16 +25,46 @@ type Model struct {
 	height           int
 	showHelp         bool
 	showStats        bool
+	showCommand      bool
 	sideBySideMode   bool
 	syntaxHighlight  bool
 	showBlame        bool
 	err              error
 	helpPanelHeight  int
 	statsPanelHeight int
+	commandHeight    int
 	activePanel      panelType
 	gitCtx           GitContext
 	branchIndex      int
+	paletteEntries   []paletteEntry
+	paletteIndex     int
+	goToLineActive   bool
+	goToLineValue    string
+	goToLineError    string
 }
+
+type paletteEntry struct {
+	section      string
+	label        string
+	description  string
+	action       paletteAction
+	offsetTarget int
+}
+
+type paletteAction int
+
+const (
+	paletteActionNone paletteAction = iota
+	paletteActionToggleHelp
+	paletteActionToggleStats
+	paletteActionToggleSideBySide
+	paletteActionToggleSyntax
+	paletteActionToggleBlame
+	paletteActionGoTop
+	paletteActionGoBottom
+	paletteActionGoToLine
+	paletteActionJumpOffset
+)
 
 type panelType int
 
@@ -63,6 +94,8 @@ type Styles struct {
 	help       lipgloss.Style
 	statusBar  lipgloss.Style
 	blame      lipgloss.Style
+	selection  lipgloss.Style
+	section    lipgloss.Style
 }
 
 // NewModel creates a new TUI model
@@ -76,11 +109,13 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 		viewport:         Viewport{offset: 0, height: 20},
 		showHelp:         false,
 		showStats:        false,
+		showCommand:      false,
 		sideBySideMode:   false,
 		syntaxHighlight:  true, // Default to enabled
 		showBlame:        gitCtx.ShowBlame,
 		helpPanelHeight:  12,
 		statsPanelHeight: 17,
+		commandHeight:    16,
 		gitCtx:           gitCtx,
 	}
 
@@ -92,6 +127,8 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 			}
 		}
 	}
+
+	model.refreshPaletteEntries()
 	return model
 }
 
@@ -128,6 +165,13 @@ func createStyles(theme config.Theme) *Styles {
 		blame: lipgloss.NewStyle().
 			Foreground(theme.HelpFg).
 			Faint(true),
+		selection: lipgloss.NewStyle().
+			Foreground(theme.TitleBg).
+			Background(theme.TitleFg).
+			Bold(true),
+		section: lipgloss.NewStyle().
+			Foreground(theme.TitleFg).
+			Bold(true),
 	}
 }
 
@@ -140,6 +184,16 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.goToLineActive {
+			m.handleGoToLineInput(msg)
+			return m, nil
+		}
+
+		if m.showCommand {
+			m.handlePaletteInput(msg)
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -153,6 +207,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.togglePanel(branchPanel)
 		case "H":
 			m.togglePanel(historyPanel)
+		case "p":
+			m.toggleCommandPalette()
 		case "v":
 			m.sideBySideMode = !m.sideBySideMode
 		case "c":
@@ -174,6 +230,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scrollToTop()
 		case "G":
 			m.scrollToBottom()
+		case "L":
+			m.openGoToLineDialog()
 		case "[":
 			m.selectPreviousBranch()
 		case "]":
@@ -210,6 +268,14 @@ func (m Model) View() string {
 	// Bottom panel (help or stats) - shown below main view if toggled
 	if m.activePanel != noPanel {
 		sections = append(sections, m.renderActivePanel())
+	}
+
+	if m.showCommand {
+		sections = append(sections, m.renderCommandPalette())
+	}
+
+	if m.goToLineActive {
+		sections = append(sections, m.renderGoToLineDialog())
 	}
 
 	// Status bar
@@ -522,6 +588,7 @@ func (m Model) renderHelpPanel() string {
 		"  k, ↑      Scroll up       │  G         Go to bottom     │  c    Toggle syntax colors",
 		"  d         Half page down  │  s         Toggle stats     │  b    Toggle blame",
 		"  u         Half page up    │  h, ?      Toggle help      │  q    Quit",
+		"  p         Command palette │  L         Go to line       │  g↵   Palette go-to-line",
 		"  S         Git status      │  B         Branch switcher  │  H    Commit history",
 		"  [ / ]     Cycle branches  │",
 		"",
@@ -535,6 +602,54 @@ func (m Model) renderHelpPanel() string {
 		Width(m.width - 2)
 
 	return helpStyle.Render(strings.Join(helpText, "\n"))
+}
+
+func (m Model) renderCommandPalette() string {
+	if len(m.paletteEntries) == 0 {
+		return ""
+	}
+
+	currentSection := ""
+	var lines []string
+	lines = append(lines, " Command Palette")
+
+	for i, entry := range m.paletteEntries {
+		if entry.section != currentSection {
+			lines = append(lines, "")
+			lines = append(lines, m.styles.section.Render(entry.section))
+			currentSection = entry.section
+		}
+
+		label := fmt.Sprintf("%s  %s", entry.label, entry.description)
+		if i == m.paletteIndex {
+			label = m.styles.selection.Render("> " + label)
+		} else {
+			label = "  " + label
+		}
+		lines = append(lines, label)
+	}
+
+	style := m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2)
+
+	return style.Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) renderGoToLineDialog() string {
+	content := fmt.Sprintf("Go to line: %s", m.goToLineValue)
+	if m.goToLineError != "" {
+		content += "  " + m.styles.removed.Render(m.goToLineError)
+	}
+	style := m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2)
+
+	return style.Render(content)
 }
 
 // renderStatsPanel renders the statistics panel below the main view
@@ -639,6 +754,262 @@ func (m Model) renderHistoryPanel() string {
 		Render(strings.Join(lines, "\n"))
 }
 
+func (m *Model) toggleCommandPalette() {
+	m.showCommand = !m.showCommand
+	m.activePanel = noPanel
+	m.goToLineActive = false
+	m.refreshPaletteEntries()
+	m.updateViewportHeight()
+}
+
+func (m *Model) handlePaletteInput(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "esc", "q":
+		m.showCommand = false
+		m.updateViewportHeight()
+	case "up", "k":
+		m.movePaletteSelection(-1)
+	case "down", "j":
+		m.movePaletteSelection(1)
+	case "enter", " ":
+		m.executePaletteSelection()
+	}
+}
+
+func (m *Model) movePaletteSelection(delta int) {
+	if len(m.paletteEntries) == 0 {
+		return
+	}
+	m.paletteIndex += delta
+	if m.paletteIndex < 0 {
+		m.paletteIndex = 0
+	}
+	if m.paletteIndex >= len(m.paletteEntries) {
+		m.paletteIndex = len(m.paletteEntries) - 1
+	}
+}
+
+func (m *Model) executePaletteSelection() {
+	if len(m.paletteEntries) == 0 {
+		return
+	}
+
+	entry := m.paletteEntries[m.paletteIndex]
+	switch entry.action {
+	case paletteActionToggleHelp:
+		m.togglePanel(helpPanel)
+	case paletteActionToggleStats:
+		m.togglePanel(statsPanel)
+	case paletteActionToggleSideBySide:
+		m.sideBySideMode = !m.sideBySideMode
+	case paletteActionToggleSyntax:
+		m.syntaxHighlight = !m.syntaxHighlight
+	case paletteActionToggleBlame:
+		m.showBlame = !m.showBlame
+		if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
+			m.gitCtx.Blame, m.err = m.collectBlame()
+		}
+	case paletteActionGoTop:
+		m.scrollToTop()
+	case paletteActionGoBottom:
+		m.scrollToBottom()
+	case paletteActionGoToLine:
+		m.openGoToLineDialog()
+	case paletteActionJumpOffset:
+		m.jumpToOffset(entry.offsetTarget)
+	}
+
+	if entry.action != paletteActionGoToLine {
+		m.showCommand = false
+	}
+	m.refreshPaletteEntries()
+	m.updateViewportHeight()
+}
+
+func (m *Model) refreshPaletteEntries() {
+	var entries []paletteEntry
+
+	entries = append(entries,
+		paletteEntry{section: "Commands", label: "Toggle help", description: "? / h", action: paletteActionToggleHelp},
+		paletteEntry{section: "Commands", label: "Toggle stats", description: "s", action: paletteActionToggleStats},
+		paletteEntry{section: "Commands", label: "Toggle side-by-side", description: "v", action: paletteActionToggleSideBySide},
+		paletteEntry{section: "Commands", label: "Toggle syntax colors", description: "c", action: paletteActionToggleSyntax},
+		paletteEntry{section: "Commands", label: "Toggle blame", description: "b", action: paletteActionToggleBlame},
+		paletteEntry{section: "Commands", label: "Go to top", description: "g", action: paletteActionGoTop},
+		paletteEntry{section: "Commands", label: "Go to bottom", description: "G", action: paletteActionGoBottom},
+		paletteEntry{section: "Commands", label: "Go to line", description: "L", action: paletteActionGoToLine},
+	)
+
+	for _, offset := range m.changeOffsets() {
+		if offset < 0 || offset >= len(m.diffResult.Lines) {
+			continue
+		}
+		line := m.diffResult.Lines[offset]
+		displayNo := displayLineNumber(line)
+		snippet := truncate(strings.TrimSpace(line.Content), 60)
+		entries = append(entries, paletteEntry{
+			section:      "Changes",
+			label:        fmt.Sprintf("Change at line %d", displayNo),
+			description:  snippet,
+			action:       paletteActionJumpOffset,
+			offsetTarget: offset,
+		})
+	}
+
+	for _, ln := range m.lineAnchors() {
+		offset := m.offsetForLine(ln)
+		entries = append(entries, paletteEntry{
+			section:      "Lines",
+			label:        fmt.Sprintf("Line %d", ln),
+			description:  "Jump to line",
+			action:       paletteActionJumpOffset,
+			offsetTarget: offset,
+		})
+	}
+
+	m.paletteEntries = entries
+	if m.paletteIndex >= len(m.paletteEntries) {
+		m.paletteIndex = max(0, len(m.paletteEntries)-1)
+	}
+}
+
+func (m *Model) changeOffsets() []int {
+	if m.diffResult == nil {
+		return nil
+	}
+	var offsets []int
+	prevChange := false
+
+	for idx, line := range m.diffResult.Lines {
+		isChange := line.Type != diff.Equal
+		if isChange && !prevChange {
+			offsets = append(offsets, idx)
+		}
+		prevChange = isChange
+	}
+	return offsets
+}
+
+func (m *Model) lineAnchors() []int {
+	if m.diffResult == nil {
+		return nil
+	}
+
+	total := len(m.diffResult.File2Lines)
+	if total == 0 {
+		total = len(m.diffResult.Lines)
+	}
+	if total == 0 {
+		return nil
+	}
+
+	step := total / 6
+	if step < 10 {
+		step = 10
+	}
+
+	anchors := []int{1}
+	for i := step; i < total; i += step {
+		anchors = append(anchors, i)
+	}
+	anchors = append(anchors, total)
+
+	unique := make(map[int]struct{})
+	var result []int
+	for _, v := range anchors {
+		if _, ok := unique[v]; ok {
+			continue
+		}
+		unique[v] = struct{}{}
+		result = append(result, v)
+	}
+
+	return result
+}
+
+func (m *Model) openGoToLineDialog() {
+	m.goToLineActive = true
+	m.goToLineValue = ""
+	m.goToLineError = ""
+	m.showCommand = false
+	m.updateViewportHeight()
+}
+
+func (m *Model) handleGoToLineInput(msg tea.KeyMsg) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.goToLineActive = false
+		m.goToLineValue = ""
+		m.goToLineError = ""
+		m.updateViewportHeight()
+	case tea.KeyEnter:
+		m.applyGoToLine()
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.goToLineValue) > 0 {
+			m.goToLineValue = m.goToLineValue[:len(m.goToLineValue)-1]
+		}
+	default:
+		if len(msg.Runes) > 0 {
+			for _, r := range msg.Runes {
+				if r >= '0' && r <= '9' {
+					m.goToLineValue += string(r)
+				}
+			}
+		}
+	}
+}
+
+func (m *Model) applyGoToLine() {
+	if m.goToLineValue == "" {
+		m.goToLineError = "Enter a line number"
+		return
+	}
+
+	lineNumber, err := strconv.Atoi(m.goToLineValue)
+	if err != nil || lineNumber < 1 {
+		m.goToLineError = "Invalid line"
+		return
+	}
+
+	offset := m.offsetForLine(lineNumber)
+	m.jumpToOffset(offset)
+	m.goToLineActive = false
+	m.goToLineError = ""
+	m.updateViewportHeight()
+}
+
+func (m *Model) offsetForLine(lineNumber int) int {
+	if m.diffResult == nil {
+		return 0
+	}
+
+	for idx, line := range m.diffResult.Lines {
+		displayNo := displayLineNumber(line)
+		if displayNo >= lineNumber && displayNo > 0 {
+			return idx
+		}
+	}
+
+	if len(m.diffResult.Lines) == 0 {
+		return 0
+	}
+	return len(m.diffResult.Lines) - 1
+}
+
+func (m *Model) jumpToOffset(offset int) {
+	if m.diffResult == nil {
+		return
+	}
+	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	m.viewport.offset = offset
+}
+
 // Scroll functions
 func (m *Model) scrollDown() {
 	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
@@ -693,6 +1064,8 @@ func (m *Model) togglePanel(target panelType) {
 
 	m.showHelp = m.activePanel == helpPanel
 	m.showStats = m.activePanel == statsPanel
+	m.showCommand = false
+	m.goToLineActive = false
 	m.updateViewportHeight()
 }
 
@@ -740,6 +1113,8 @@ func (m *Model) reloadDiff() {
 	if m.showBlame {
 		m.gitCtx.Blame, _ = m.collectBlame()
 	}
+
+	m.refreshPaletteEntries()
 }
 
 func (m *Model) readLinesForRef(ref string) ([]string, error) {
@@ -807,6 +1182,14 @@ func (m *Model) updateViewportHeight() {
 		baseHeight -= m.statsPanelHeight
 	}
 
+	if m.showCommand {
+		baseHeight -= min(m.commandHeight, len(m.paletteEntries)+4)
+	}
+
+	if m.goToLineActive {
+		baseHeight -= 3
+	}
+
 	// Ensure minimum height
 	if baseHeight < 5 {
 		baseHeight = 5
@@ -835,4 +1218,14 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+func displayLineNumber(line diff.DiffLine) int {
+	if line.LineNo2 > 0 {
+		return line.LineNo2
+	}
+	if line.LineNo1 > 0 {
+		return line.LineNo1
+	}
+	return 0
 }
