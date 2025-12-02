@@ -2,6 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -12,7 +15,8 @@ import (
 
 // Model represents the application state
 type Model struct {
-	diffResult       *diff.DiffResult
+	diffs            []*diff.DiffResult
+	activeDiff       int
 	config           *config.Config
 	styles           *Styles
 	viewport         Viewport
@@ -22,6 +26,10 @@ type Model struct {
 	showStats        bool
 	sideBySideMode   bool
 	syntaxHighlight  bool
+	quickSwitchOpen  bool
+	quickSwitchIndex int
+	filePicker       FilePicker
+	workingDir       string
 	err              error
 	helpPanelHeight  int
 	statsPanelHeight int
@@ -35,21 +43,41 @@ type Viewport struct {
 
 // Styles holds all the lipgloss styles
 type Styles struct {
-	added      lipgloss.Style
-	removed    lipgloss.Style
-	unchanged  lipgloss.Style
-	lineNumber lipgloss.Style
-	border     lipgloss.Style
-	title      lipgloss.Style
-	help       lipgloss.Style
-	statusBar  lipgloss.Style
+	added       lipgloss.Style
+	removed     lipgloss.Style
+	unchanged   lipgloss.Style
+	lineNumber  lipgloss.Style
+	border      lipgloss.Style
+	title       lipgloss.Style
+	help        lipgloss.Style
+	statusBar   lipgloss.Style
+	tabActive   lipgloss.Style
+	tabInactive lipgloss.Style
+	modal       lipgloss.Style
+}
+
+// FilePicker is a lightweight file selection helper for creating new diffs
+type FilePicker struct {
+	Visible         bool
+	Entries         []fileEntry
+	Cursor          int
+	SelectingSecond bool
+	FirstFile       string
+	Err             error
+}
+
+type fileEntry struct {
+	Name  string
+	Path  string
+	IsDir bool
 }
 
 // NewModel creates a new TUI model
 func NewModel(diffResult *diff.DiffResult, cfg *config.Config) Model {
 	styles := createStyles(cfg.Theme)
+	wd, _ := os.Getwd()
 	return Model{
-		diffResult:       diffResult,
+		diffs:            []*diff.DiffResult{diffResult},
 		config:           cfg,
 		styles:           styles,
 		viewport:         Viewport{offset: 0, height: 20},
@@ -57,6 +85,8 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config) Model {
 		showStats:        false,
 		sideBySideMode:   false,
 		syntaxHighlight:  true, // Default to enabled
+		quickSwitchIndex: 0,
+		workingDir:       wd,
 		helpPanelHeight:  12,
 		statsPanelHeight: 17,
 	}
@@ -92,6 +122,20 @@ func createStyles(theme config.Theme) *Styles {
 			Foreground(theme.TitleFg).
 			Background(theme.TitleBg).
 			Padding(0, 1),
+		tabActive: lipgloss.NewStyle().
+			Foreground(theme.TitleFg).
+			Background(theme.TitleBg).
+			Padding(0, 1).
+			Bold(true),
+		tabInactive: lipgloss.NewStyle().
+			Foreground(theme.HelpFg).
+			Padding(0, 1),
+		modal: lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(theme.BorderFg).
+			Padding(1, 2).
+			Background(theme.TitleBg).
+			Foreground(theme.TitleFg),
 	}
 }
 
@@ -104,6 +148,14 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.filePicker.Visible {
+			return m.handleFilePickerKey(msg)
+		}
+
+		if m.quickSwitchOpen {
+			return m.handleQuickSwitchKey(msg)
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -137,6 +189,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scrollToTop()
 		case "G":
 			m.scrollToBottom()
+		case "tab":
+			m.nextTab()
+		case "shift+tab":
+			m.prevTab()
+		case "t":
+			m.toggleQuickSwitch()
+		case "o":
+			m.openFilePicker()
 		}
 
 	case tea.WindowSizeMsg:
@@ -154,13 +214,14 @@ func (m Model) View() string {
 		return fmt.Sprintf("Error: %v\n", m.err)
 	}
 
-	if m.diffResult == nil {
+	if m.activeDiffResult() == nil {
 		return "No diff to display\n"
 	}
 
 	var sections []string
 
-	// Title
+	// Tabs and title
+	sections = append(sections, m.renderTabs())
 	sections = append(sections, m.renderTitle())
 
 	// Main diff content (always shown)
@@ -176,30 +237,55 @@ func (m Model) View() string {
 	// Status bar
 	sections = append(sections, m.renderStatusBar())
 
-	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+	content := lipgloss.JoinVertical(lipgloss.Left, sections...)
+
+	if m.quickSwitchOpen {
+		content = lipgloss.JoinVertical(lipgloss.Left, content, m.renderQuickSwitch())
+	}
+
+	if m.filePicker.Visible {
+		content = lipgloss.JoinVertical(lipgloss.Left, content, m.renderFilePicker())
+	}
+
+	return content
 }
 
 // renderTitle renders the title bar
 func (m Model) renderTitle() string {
 	title := fmt.Sprintf("gdiff: %s ↔ %s",
-		truncate(m.diffResult.File1Name, 40),
-		truncate(m.diffResult.File2Name, 40))
+		truncate(m.activeDiffResult().File1Name, 40),
+		truncate(m.activeDiffResult().File2Name, 40))
 	return m.styles.title.Render(title)
+}
+
+// renderTabs renders the list of open diffs
+func (m Model) renderTabs() string {
+	var tabs []string
+	for i, d := range m.diffs {
+		label := fmt.Sprintf("%d:%s", i+1, truncate(filepath.Base(d.File1Name)+"↔"+filepath.Base(d.File2Name), 22))
+		if i == m.activeDiff {
+			tabs = append(tabs, m.styles.tabActive.Render(label))
+		} else {
+			tabs = append(tabs, m.styles.tabInactive.Render(label))
+		}
+	}
+
+	return lipgloss.JoinHorizontal(lipgloss.Left, tabs...)
 }
 
 // renderDiff renders the diff content
 func (m Model) renderDiff() string {
 	// Calculate visible range
 	start := m.viewport.offset
-	end := min(start+m.viewport.height, len(m.diffResult.Lines))
+	end := min(start+m.viewport.height, len(m.activeDiffResult().Lines))
 
-	if start >= len(m.diffResult.Lines) {
-		start = max(0, len(m.diffResult.Lines)-m.viewport.height)
+	if start >= len(m.activeDiffResult().Lines) {
+		start = max(0, len(m.activeDiffResult().Lines)-m.viewport.height)
 		m.viewport.offset = start
-		end = len(m.diffResult.Lines)
+		end = len(m.activeDiffResult().Lines)
 	}
 
-	if start >= end || len(m.diffResult.Lines) == 0 {
+	if start >= end || len(m.activeDiffResult().Lines) == 0 {
 		return m.styles.unchanged.Render("No differences found.")
 	}
 
@@ -215,7 +301,7 @@ func (m Model) renderUnified(start, end int) string {
 	var lines []string
 
 	for i := start; i < end; i++ {
-		line := m.diffResult.Lines[i]
+		line := m.activeDiffResult().Lines[i]
 		lines = append(lines, m.renderLine(line))
 	}
 
@@ -234,7 +320,7 @@ func (m Model) renderSideBySide(start, end int) string {
 
 	// Render each line with left (file1) and right (file2) columns
 	for i := start; i < end; i++ {
-		line := m.diffResult.Lines[i]
+		line := m.activeDiffResult().Lines[i]
 		leftContent, rightContent := m.renderSideBySideLine(line, columnWidth)
 
 		// Join left and right with separator
@@ -411,7 +497,7 @@ func (m Model) renderLine(line diff.DiffLine) string {
 
 // renderStatusBar renders the status bar
 func (m Model) renderStatusBar() string {
-	added, removed, unchanged := m.diffResult.GetStats()
+	added, removed, unchanged := m.activeDiffResult().GetStats()
 
 	// View mode indicator
 	viewMode := "unified"
@@ -426,13 +512,217 @@ func (m Model) renderStatusBar() string {
 	}
 
 	status := fmt.Sprintf(
-		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Color: %s | v:view c:color s:stats ?:help q:quit",
+		"Tab %d/%d | Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Color: %s | tab/shift+tab switch t quick switch o open | v:view c:color s:stats ?:help q:quit",
+		m.activeDiff+1, len(m.diffs),
 		added, removed, unchanged,
-		m.viewport.offset+1, len(m.diffResult.Lines),
+		m.viewport.offset+1, len(m.activeDiffResult().Lines),
 		viewMode, syntaxMode,
 	)
 
 	return m.styles.statusBar.Width(m.width).Render(status)
+}
+
+func (m Model) renderQuickSwitch() string {
+	var items []string
+	for i, d := range m.diffs {
+		label := fmt.Sprintf("%d: %s ↔ %s", i+1, filepath.Base(d.File1Name), filepath.Base(d.File2Name))
+		if i == m.quickSwitchIndex {
+			label = m.styles.tabActive.Render(label)
+		} else {
+			label = m.styles.tabInactive.Render(label)
+		}
+		items = append(items, label)
+	}
+
+	content := strings.Join(items, "\n")
+	header := m.styles.title.Render("Quick Switch (enter to open, esc to close)")
+	return m.styles.modal.Width(m.width - 4).Render(header + "\n" + content)
+}
+
+func (m Model) renderFilePicker() string {
+	var lines []string
+	lines = append(lines, m.styles.title.Render("Open new diff from "+m.workingDir))
+
+	if m.filePicker.Err != nil {
+		lines = append(lines, m.styles.removed.Render("Error: "+m.filePicker.Err.Error()))
+	}
+
+	hint := "Select first file"
+	if m.filePicker.SelectingSecond {
+		hint = fmt.Sprintf("First: %s | Select second file", filepath.Base(m.filePicker.FirstFile))
+	}
+	lines = append(lines, m.styles.help.Render(hint))
+
+	for i, entry := range m.filePicker.Entries {
+		prefix := "  "
+		if i == m.filePicker.Cursor {
+			prefix = "➜ "
+		}
+
+		name := entry.Name
+		if entry.IsDir {
+			name += "/"
+		}
+
+		rendered := m.styles.unchanged.Render(name)
+		if entry.IsDir {
+			rendered = m.styles.help.Render(name)
+		}
+
+		lines = append(lines, prefix+rendered)
+	}
+
+	footer := m.styles.help.Render("enter: select • esc: close • directories open navigation")
+	lines = append(lines, footer)
+
+	return m.styles.modal.Width(m.width - 4).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) activeDiffResult() *diff.DiffResult {
+	if m.activeDiff < 0 || m.activeDiff >= len(m.diffs) {
+		return nil
+	}
+	return m.diffs[m.activeDiff]
+}
+
+func (m *Model) resetViewport() {
+	m.viewport.offset = 0
+}
+
+func (m *Model) nextTab() {
+	if len(m.diffs) == 0 {
+		return
+	}
+	m.activeDiff = (m.activeDiff + 1) % len(m.diffs)
+	m.quickSwitchIndex = m.activeDiff
+	m.resetViewport()
+}
+
+func (m *Model) prevTab() {
+	if len(m.diffs) == 0 {
+		return
+	}
+	m.activeDiff = (m.activeDiff - 1 + len(m.diffs)) % len(m.diffs)
+	m.quickSwitchIndex = m.activeDiff
+	m.resetViewport()
+}
+
+func (m *Model) toggleQuickSwitch() {
+	m.quickSwitchOpen = !m.quickSwitchOpen
+	m.quickSwitchIndex = m.activeDiff
+}
+
+func (m *Model) handleQuickSwitchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.quickSwitchOpen = false
+	case "enter":
+		m.activeDiff = m.quickSwitchIndex
+		m.quickSwitchOpen = false
+		m.resetViewport()
+	case "up", "k":
+		if m.quickSwitchIndex > 0 {
+			m.quickSwitchIndex--
+		}
+	case "down", "j":
+		if m.quickSwitchIndex < len(m.diffs)-1 {
+			m.quickSwitchIndex++
+		}
+	}
+
+	return m, nil
+}
+
+func (m *Model) openFilePicker() {
+	m.filePicker.Visible = true
+	m.filePicker.Cursor = 0
+	m.filePicker.SelectingSecond = false
+	m.filePicker.FirstFile = ""
+	m.filePicker.Err = nil
+	m.refreshFilePickerEntries()
+}
+
+func (m *Model) refreshFilePickerEntries() {
+	entries, err := os.ReadDir(m.workingDir)
+	if err != nil {
+		m.filePicker.Err = err
+		return
+	}
+
+	var items []fileEntry
+	if parent := filepath.Dir(m.workingDir); parent != m.workingDir {
+		items = append(items, fileEntry{Name: "..", Path: parent, IsDir: true})
+	}
+	for _, entry := range entries {
+		info := fileEntry{
+			Name:  entry.Name(),
+			Path:  filepath.Join(m.workingDir, entry.Name()),
+			IsDir: entry.IsDir(),
+		}
+		items = append(items, info)
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].IsDir == items[j].IsDir {
+			return items[i].Name < items[j].Name
+		}
+		return items[i].IsDir && !items[j].IsDir
+	})
+
+	m.filePicker.Entries = items
+	if m.filePicker.Cursor >= len(items) {
+		m.filePicker.Cursor = max(0, len(items)-1)
+	}
+}
+
+func (m *Model) handleFilePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.filePicker.Visible = false
+		return m, nil
+	case "up", "k":
+		if m.filePicker.Cursor > 0 {
+			m.filePicker.Cursor--
+		}
+	case "down", "j":
+		if m.filePicker.Cursor < len(m.filePicker.Entries)-1 {
+			m.filePicker.Cursor++
+		}
+	case "enter":
+		if len(m.filePicker.Entries) == 0 {
+			return m, nil
+		}
+
+		entry := m.filePicker.Entries[m.filePicker.Cursor]
+		if entry.IsDir {
+			m.workingDir = entry.Path
+			m.refreshFilePickerEntries()
+			return m, nil
+		}
+
+		if !m.filePicker.SelectingSecond {
+			m.filePicker.FirstFile = entry.Path
+			m.filePicker.SelectingSecond = true
+			return m, nil
+		}
+
+		engine := diff.NewEngine()
+		result, err := engine.DiffFiles(m.filePicker.FirstFile, entry.Path)
+		if err != nil {
+			m.filePicker.Err = err
+			return m, nil
+		}
+
+		m.diffs = append(m.diffs, result)
+		m.activeDiff = len(m.diffs) - 1
+		m.quickSwitchIndex = m.activeDiff
+		m.resetViewport()
+		m.filePicker.Visible = false
+		m.filePicker.SelectingSecond = false
+		m.filePicker.FirstFile = ""
+	}
+
+	return m, nil
 }
 
 // renderHelpPanel renders the help panel below the main view
@@ -442,8 +732,9 @@ func (m Model) renderHelpPanel() string {
 		"Keyboard Shortcuts:",
 		"  j, ↓      Scroll down     │  g         Go to top        │  v    Toggle side-by-side",
 		"  k, ↑      Scroll up       │  G         Go to bottom     │  c    Toggle syntax colors",
-		"  d         Half page down  │  s         Toggle stats     │  q    Quit",
-		"  u         Half page up    │  h, ?      Toggle help      │",
+		"  d         Half page down  │  s         Toggle stats     │  o    Open new diff",
+		"  u         Half page up    │  h, ?      Toggle help      │  t    Quick switch",
+		"  tab       Next tab        │  shift+tab Previous tab     │  q    Quit",
 		"",
 	}
 
@@ -459,7 +750,7 @@ func (m Model) renderHelpPanel() string {
 
 // renderStatsPanel renders the statistics panel below the main view
 func (m Model) renderStatsPanel() string {
-	added, removed, unchanged := m.diffResult.GetStats()
+	added, removed, unchanged := m.activeDiffResult().GetStats()
 	total := added + removed + unchanged
 
 	addedPercent := 0.0
@@ -479,8 +770,8 @@ func (m Model) renderStatsPanel() string {
 		"Diff Statistics",
 		"═══════════════",
 		fmt.Sprintf("File 1: %s  │  File 2: %s",
-			truncate(m.diffResult.File1Name, 35),
-			truncate(m.diffResult.File2Name, 35)),
+			truncate(m.activeDiffResult().File1Name, 35),
+			truncate(m.activeDiffResult().File2Name, 35)),
 		"",
 		fmt.Sprintf("Total: %d lines  │  Added: %d (%.1f%%)  │  Removed: %d (%.1f%%)  │  Unchanged: %d (%.1f%%)",
 			total, added, addedPercent, removed, removedPercent, unchanged, unchangedPercent),
@@ -500,7 +791,7 @@ func (m Model) renderStatsPanel() string {
 
 // Scroll functions
 func (m *Model) scrollDown() {
-	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	maxOffset := max(0, len(m.activeDiffResult().Lines)-m.viewport.height)
 	if m.viewport.offset < maxOffset {
 		m.viewport.offset++
 	}
@@ -518,7 +809,7 @@ func (m *Model) scrollPageDown() {
 		halfPage = 1
 	}
 	m.viewport.offset += halfPage
-	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	maxOffset := max(0, len(m.activeDiffResult().Lines)-m.viewport.height)
 	if m.viewport.offset > maxOffset {
 		m.viewport.offset = maxOffset
 	}
@@ -540,7 +831,7 @@ func (m *Model) scrollToTop() {
 }
 
 func (m *Model) scrollToBottom() {
-	m.viewport.offset = max(0, len(m.diffResult.Lines)-m.viewport.height)
+	m.viewport.offset = max(0, len(m.activeDiffResult().Lines)-m.viewport.height)
 }
 
 // updateViewportHeight calculates and sets the viewport height based on screen size and active panels
