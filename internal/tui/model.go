@@ -16,7 +16,8 @@ import (
 
 // Model represents the application state
 type Model struct {
-	diffResult       *diff.DiffResult
+	diffs            []*diff.DiffResult
+	activeDiff       int
 	config           *config.Config
 	keybindings      config.Keybindings
 	overrideKeys     config.Keybindings
@@ -430,13 +431,14 @@ func (m Model) View() string {
 		return fmt.Sprintf("Error: %v\n", m.err)
 	}
 
-	if m.diffResult == nil {
+	if m.activeDiffResult() == nil {
 		return "No diff to display\n"
 	}
 
 	var sections []string
 
-	// Title
+	// Tabs and title
+	sections = append(sections, m.renderTabs())
 	sections = append(sections, m.renderTitle())
 
 	// Main diff content (always shown)
@@ -462,7 +464,17 @@ func (m Model) View() string {
 	// Status bar
 	sections = append(sections, m.renderStatusBar())
 
-	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+	content := lipgloss.JoinVertical(lipgloss.Left, sections...)
+
+	if m.quickSwitchOpen {
+		content = lipgloss.JoinVertical(lipgloss.Left, content, m.renderQuickSwitch())
+	}
+
+	if m.filePicker.Visible {
+		content = lipgloss.JoinVertical(lipgloss.Left, content, m.renderFilePicker())
+	}
+
+	return content
 }
 
 // renderTitle renders the title bar
@@ -477,6 +489,21 @@ func (m Model) renderTitle() string {
 			truncate(m.diffResult.File2Name, 25), m.gitCtx.Ref2)
 	}
 	return m.styles.title.Render(title)
+}
+
+// renderTabs renders the list of open diffs
+func (m Model) renderTabs() string {
+	var tabs []string
+	for i, d := range m.diffs {
+		label := fmt.Sprintf("%d:%s", i+1, truncate(filepath.Base(d.File1Name)+"↔"+filepath.Base(d.File2Name), 22))
+		if i == m.activeDiff {
+			tabs = append(tabs, m.styles.tabActive.Render(label))
+		} else {
+			tabs = append(tabs, m.styles.tabInactive.Render(label))
+		}
+	}
+
+	return lipgloss.JoinHorizontal(lipgloss.Left, tabs...)
 }
 
 // renderDiff renders the diff content
@@ -1361,8 +1388,8 @@ func (m Model) renderStatsPanel() string {
 		"Diff Statistics",
 		"═══════════════",
 		fmt.Sprintf("File 1: %s  │  File 2: %s",
-			truncate(m.diffResult.File1Name, 35),
-			truncate(m.diffResult.File2Name, 35)),
+			truncate(m.activeDiffResult().File1Name, 35),
+			truncate(m.activeDiffResult().File2Name, 35)),
 		"",
 		fmt.Sprintf("Total: %d lines  │  Added: %d (%.1f%%)  │  Removed: %d (%.1f%%)  │  Unchanged: %d (%.1f%%)",
 			total, added, addedPercent, removed, removedPercent, unchanged, unchangedPercent),
