@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cj3636/gdiff/internal/config"
 	"github.com/cj3636/gdiff/internal/diff"
+	"github.com/cj3636/gdiff/internal/export"
 	"github.com/cj3636/gdiff/internal/tui"
 	flag "github.com/spf13/pflag"
 )
@@ -23,6 +24,9 @@ var (
 	ref1             string
 	ref2             string
 	showBlame        bool
+	exportFormat     string
+	exportFile       string
+	exportCopy       bool
 )
 
 func init() {
@@ -33,6 +37,9 @@ func init() {
 	flag.StringVar(&ref1, "ref1", "", "Git reference for the left side (defaults to HEAD if ref2 is set)")
 	flag.StringVar(&ref2, "ref2", "", "Git reference for the right side (defaults to working tree)")
 	flag.BoolVar(&showBlame, "blame", false, "Show git blame information when available")
+	flag.StringVar(&exportFormat, "export-format", "", "Export diff as html, markdown, or ansi without launching the TUI")
+	flag.StringVar(&exportFile, "export-file", "", "Write exported diff to the provided file path")
+	flag.BoolVar(&exportCopy, "export-copy", false, "Copy the exported diff to your clipboard")
 	flag.BoolVarP(&help, "help", "h", false, "Show help information")
 	flag.Usage = usage
 }
@@ -51,6 +58,7 @@ func usage() {
 	fmt.Println("  gdiff old.txt new.txt")
 	fmt.Println("  gdiff -n old.json new.json          # Hide line numbers")
 	fmt.Println("  gdiff -t 2 config1.yaml config2.yaml # Use 2-space tabs")
+	fmt.Println("  gdiff --export-format html --export-file diff.html fileA fileB # Export without TUI")
 	fmt.Println("")
 	fmt.Println("Keyboard shortcuts:")
 	fmt.Println("  j/↓    Scroll down")
@@ -68,6 +76,26 @@ func usage() {
 	fmt.Println("  H      View recent commit history")
 	fmt.Println("  ?/h    Toggle help panel")
 	fmt.Println("  q      Quit")
+}
+
+func parseExportFormat(raw string) (export.Format, error) {
+	switch strings.ToLower(raw) {
+	case "", string(export.FormatMarkdown), "md":
+		return export.FormatMarkdown, nil
+	case string(export.FormatHTML), "htm":
+		return export.FormatHTML, nil
+	case string(export.FormatANSI), "text", "ansi":
+		return export.FormatANSI, nil
+	default:
+		return "", fmt.Errorf("unsupported export format: %s", raw)
+	}
+}
+
+func buildExportTitle(result *diff.DiffResult) string {
+	if result == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s ↔ %s", filepath.Base(result.File1Name), filepath.Base(result.File2Name))
 }
 
 func loadGitDiff(engine *diff.Engine, target, leftRef, rightRef string, includeBlame bool) (tui.GitContext, *diff.DiffResult, error) {
@@ -276,6 +304,47 @@ func main() {
 	cfg.ShowLineNo = !noLineNumber
 	cfg.TabSize = tabSize
 	cfg.IgnoreWhitespace = ignoreWhitespace
+
+	if exportFormat != "" || exportFile != "" || exportCopy {
+		format, err := parseExportFormat(exportFormat)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if format == "" {
+			format = export.FormatMarkdown
+		}
+
+		rendered, err := export.Render(diffResult, format, export.Options{
+			Title:           buildExportTitle(diffResult),
+			ShowLineNumbers: cfg.ShowLineNo,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error exporting diff: %v\n", err)
+			os.Exit(1)
+		}
+
+		if exportFile != "" {
+			if err := os.WriteFile(exportFile, []byte(rendered), 0o644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing export: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "Diff saved to %s\n", exportFile)
+		}
+
+		if exportCopy {
+			if err := export.CopyToClipboard(rendered, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "Error copying diff to clipboard: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("Diff copied to clipboard.")
+		}
+
+		if exportFile == "" && !exportCopy {
+			fmt.Println(rendered)
+		}
+		os.Exit(0)
+	}
 
 	// If no changes, just report and exit
 	if !diffResult.HasChanges() {

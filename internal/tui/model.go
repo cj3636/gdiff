@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/cj3636/gdiff/internal/config"
 	"github.com/cj3636/gdiff/internal/diff"
+	"github.com/cj3636/gdiff/internal/export"
 )
 
 // Model represents the application state
@@ -45,6 +46,7 @@ type Model struct {
 	minimapWidth     int
 	minimapStartCol  int
 	minimapHeight    int
+	statusMessage    string
 }
 
 type paletteEntry struct {
@@ -53,6 +55,7 @@ type paletteEntry struct {
 	description  string
 	action       paletteAction
 	offsetTarget int
+	format       export.Format
 }
 
 type paletteAction int
@@ -69,6 +72,8 @@ const (
 	paletteActionGoBottom
 	paletteActionGoToLine
 	paletteActionJumpOffset
+	paletteActionCopyDiff
+	paletteActionSaveDiff
 )
 
 type panelType int
@@ -231,6 +236,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
 				m.gitCtx.Blame, m.err = m.collectBlame()
 			}
+		case "y":
+			m.copyDiff(export.FormatMarkdown)
+		case "o":
+			m.saveDiff(export.FormatHTML)
 		case "<":
 			m.adjustMinimapWidth(-2)
 		case ">":
@@ -880,6 +889,10 @@ func (m Model) renderStatusBar() string {
 		viewMode, wrapMode, syntaxMode, gitInfo,
 	)
 
+	if m.statusMessage != "" {
+		status = fmt.Sprintf("%s | %s", status, m.statusMessage)
+	}
+
 	return m.styles.statusBar.Width(m.width).Render(status)
 }
 
@@ -908,11 +921,11 @@ func (m Model) renderHelpPanel() string {
 		"  j, ↓      Scroll down     │  g         Go to top        │  v    Toggle side-by-side",
 		"  k, ↑      Scroll up       │  G         Go to bottom     │  c    Toggle syntax colors",
 		"  d         Half page down  │  s         Toggle stats     │  b    Toggle blame",
-		"  u         Half page up    │  w         Toggle wrapping  │  q    Quit",
+		"  u         Half page up    │  y         Copy diff        │  o    Save diff (HTML)",
 		"  p         Command palette │  L         Go to line       │  g↵   Palette go-to-line",
-		"  S         Git status      │  B         Branch switcher  │  H    Commit history",
-		"  [ / ]     Cycle branches  │  < / >     Resize minimap",
-		"  n / N     Next/prev change│  Mouse     Jump via minimap",
+		"  w         Toggle wrapping │  S         Git status       │  B    Branch switcher",
+		"  H         Commit history  │  [ / ]     Cycle branches   │  < / > Resize minimap",
+		"  n / N     Next/prev change│  Mouse     Jump via minimap │  q    Quit",
 		"",
 	}
 
@@ -1141,6 +1154,10 @@ func (m *Model) executePaletteSelection() {
 		m.openGoToLineDialog()
 	case paletteActionJumpOffset:
 		m.jumpToOffset(entry.offsetTarget)
+	case paletteActionCopyDiff:
+		m.copyDiff(entry.format)
+	case paletteActionSaveDiff:
+		m.saveDiff(entry.format)
 	}
 
 	if entry.action != paletteActionGoToLine {
@@ -1163,6 +1180,9 @@ func (m *Model) refreshPaletteEntries() {
 		paletteEntry{section: "Commands", label: "Go to top", description: "g", action: paletteActionGoTop},
 		paletteEntry{section: "Commands", label: "Go to bottom", description: "G", action: paletteActionGoBottom},
 		paletteEntry{section: "Commands", label: "Go to line", description: "L", action: paletteActionGoToLine},
+		paletteEntry{section: "Export", label: "Copy diff (Markdown)", description: "y", action: paletteActionCopyDiff, format: export.FormatMarkdown},
+		paletteEntry{section: "Export", label: "Copy diff (ANSI)", description: "command palette", action: paletteActionCopyDiff, format: export.FormatANSI},
+		paletteEntry{section: "Export", label: "Save diff (HTML)", description: "o", action: paletteActionSaveDiff, format: export.FormatHTML},
 	)
 
 	for _, offset := range m.changeOffsets() {
@@ -1195,6 +1215,114 @@ func (m *Model) refreshPaletteEntries() {
 	m.paletteEntries = entries
 	if m.paletteIndex >= len(m.paletteEntries) {
 		m.paletteIndex = max(0, len(m.paletteEntries)-1)
+	}
+}
+
+func (m *Model) copyDiff(format export.Format) {
+	if m.diffResult == nil {
+		return
+	}
+
+	content := m.exportDiff(format)
+	if content == "" {
+		return
+	}
+
+	if err := export.CopyToClipboard(content, os.Stdout); err != nil {
+		m.err = err
+		return
+	}
+
+	m.statusMessage = fmt.Sprintf("Copied %s diff to clipboard", formatLabel(format))
+}
+
+func (m *Model) saveDiff(format export.Format) {
+	if m.diffResult == nil {
+		return
+	}
+
+	content := m.exportDiff(format)
+	if content == "" {
+		return
+	}
+
+	filename := m.defaultExportFilename(format)
+	if err := os.WriteFile(filename, []byte(content), 0o644); err != nil {
+		m.err = err
+		return
+	}
+
+	m.statusMessage = fmt.Sprintf("Saved %s diff to %s", formatLabel(format), filename)
+}
+
+func (m *Model) exportDiff(format export.Format) string {
+	if format == "" {
+		format = export.FormatMarkdown
+	}
+
+	content, err := export.Render(m.diffResult, format, export.Options{
+		Title:           m.exportTitle(),
+		ShowLineNumbers: m.config.ShowLineNo,
+	})
+	if err != nil {
+		m.err = err
+		return ""
+	}
+
+	return content
+}
+
+func (m Model) exportTitle() string {
+	if m.diffResult == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s ↔ %s", m.diffResult.File1Name, m.diffResult.File2Name)
+}
+
+func (m Model) defaultExportFilename(format export.Format) string {
+	ext := "txt"
+	switch format {
+	case export.FormatHTML:
+		ext = "html"
+	case export.FormatMarkdown:
+		ext = "md"
+	case export.FormatANSI:
+		ext = "txt"
+	}
+
+	left := sanitizeFilename(filepath.Base(m.diffResult.File1Name))
+	right := sanitizeFilename(filepath.Base(m.diffResult.File2Name))
+	if left == "" {
+		left = "file1"
+	}
+	if right == "" {
+		right = "file2"
+	}
+
+	return fmt.Sprintf("gdiff_%s_vs_%s.%s", left, right, ext)
+}
+
+func sanitizeFilename(name string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		default:
+			return r
+		}
+	}, name)
+
+	return strings.Trim(cleaned, " ")
+}
+
+func formatLabel(f export.Format) string {
+	switch f {
+	case export.FormatHTML:
+		return "HTML"
+	case export.FormatANSI:
+		return "ANSI"
+	default:
+		return "Markdown"
 	}
 }
 
