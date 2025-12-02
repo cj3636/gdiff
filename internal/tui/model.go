@@ -162,6 +162,8 @@ type Styles struct {
 	removed    lipgloss.Style
 	unchanged  lipgloss.Style
 	lineNumber lipgloss.Style
+	inlineAdd  lipgloss.Style
+	inlineDel  lipgloss.Style
 	border     lipgloss.Style
 	title      lipgloss.Style
 	help       lipgloss.Style
@@ -276,8 +278,13 @@ func createStyles(cfg *config.Config) *Styles {
 			Background(theme.RemovedBg).
 			Padding(0, padding),
 		unchanged: lipgloss.NewStyle().
-			Foreground(theme.UnchangedFg).
-			Padding(0, padding),
+			Foreground(theme.UnchangedFg),
+		inlineAdd: lipgloss.NewStyle().
+			Foreground(theme.AddedFg).
+			Background(theme.AddedBg).Bold(true),
+		inlineDel: lipgloss.NewStyle().
+			Foreground(theme.RemovedFg).
+			Background(theme.RemovedBg).Bold(true),
 		lineNumber: lipgloss.NewStyle().
 			Foreground(theme.LineNumberFg).
 			Width(gutterWidth).
@@ -528,30 +535,33 @@ func (m Model) renderUnifiedLines(start, end, contentWidth int, diffLines []diff
 	var lines []string
 
 	for i := start; i < end; i++ {
-		prefix, style, content := m.buildUnifiedLineParts(diffLines[i])
+		prefix, style, content, highlights := m.buildUnifiedLineParts(m.diffResult.Lines[i])
 		available := contentWidth - lipgloss.Width(prefix)
 		if available < 10 {
 			available = 10
 		}
 
-		wrapped := []string{content}
-		if m.wrapLines {
-			wrapped = wrapText(content, available)
-		}
-
-		for _, part := range wrapped {
-			trimmed := truncateWidth(part, available)
-			lines = append(lines, prefix+style.Render(trimmed))
-			for s := 0; s < m.config.Spacing.LineSpacing; s++ {
-				lines = append(lines, "")
-			}
+		segments := m.renderHighlightedSegments(content, highlights, style, m.highlightStyleForLine(m.diffResult.Lines[i]), available)
+		for _, segment := range segments {
+			lines = append(lines, prefix+segment)
 		}
 	}
 
 	return lines
 }
 
-func (m Model) renderSideBySideLines(start, end, contentWidth int, diffLines []diff.DiffLine) []string {
+func (m Model) highlightStyleForLine(line diff.DiffLine) lipgloss.Style {
+	switch line.Type {
+	case diff.Added:
+		return m.styles.inlineAdd
+	case diff.Removed:
+		return m.styles.inlineDel
+	default:
+		return m.styles.unchanged
+	}
+}
+
+func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
 	var lines []string
 
 	columnWidth := (contentWidth - 3) / 2
@@ -655,7 +665,7 @@ func (m Model) renderMinimap() string {
 	return strings.Join(rows, "\n")
 }
 
-func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style, string) {
+func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style, string, []diff.Highlight) {
 	var parts []string
 
 	if m.config.ShowLineNo {
@@ -698,7 +708,30 @@ func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style
 	}
 
 	content := symbol + " " + line.Content
-	return strings.Join(parts, ""), style, content
+	displayHighlights := offsetHighlights(line.Highlights, runeLen(symbol+" "))
+	return strings.Join(parts, ""), style, content, displayHighlights
+}
+
+func (m Model) renderHighlightedSegments(content string, highlights []diff.Highlight, baseStyle, highlightStyle lipgloss.Style, width int) []string {
+	wrapped := []string{content}
+	if m.wrapLines {
+		wrapped = wrapText(content, width)
+	}
+
+	var segments []string
+	offset := 0
+	for _, part := range wrapped {
+		trimmed := truncateWidth(part, width)
+		visibleLen := runeLen(trimmed)
+		if visibleLen < width {
+			trimmed = padRight(trimmed, width)
+		}
+		local := sliceHighlights(highlights, offset, offset+visibleLen)
+		segments = append(segments, applyHighlights(trimmed, local, baseStyle, highlightStyle))
+		offset += runeLen(part)
+	}
+
+	return segments
 }
 
 func wrapText(text string, width int) []string {
@@ -731,6 +764,18 @@ func wrapText(text string, width int) []string {
 	return lines
 }
 
+func runeLen(text string) int {
+	return len([]rune(text))
+}
+
+func padRight(text string, width int) string {
+	padding := width - runeLen(text)
+	if padding <= 0 {
+		return text
+	}
+	return text + strings.Repeat(" ", padding)
+}
+
 func truncateWidth(text string, width int) string {
 	if width <= 0 {
 		return ""
@@ -752,6 +797,69 @@ func truncateWidth(text string, width int) string {
 	}
 
 	return builder.String() + "..."
+}
+
+func applyHighlights(text string, highlights []diff.Highlight, baseStyle, highlightStyle lipgloss.Style) string {
+	if len(highlights) == 0 {
+		return baseStyle.Render(text)
+	}
+
+	type segment struct {
+		start int
+		end   int
+		style lipgloss.Style
+	}
+
+	runes := []rune(text)
+	var segments []segment
+	cursor := 0
+	for _, h := range highlights {
+		if h.Start > cursor {
+			segments = append(segments, segment{start: cursor, end: h.Start, style: baseStyle})
+		}
+		segments = append(segments, segment{start: h.Start, end: h.End, style: highlightStyle})
+		cursor = h.End
+	}
+
+	total := len(runes)
+	if cursor < total {
+		segments = append(segments, segment{start: cursor, end: total, style: baseStyle})
+	}
+
+	var builder strings.Builder
+	for _, seg := range segments {
+		if seg.end <= seg.start || seg.start >= len(runes) {
+			continue
+		}
+		if seg.end > len(runes) {
+			seg.end = len(runes)
+		}
+		builder.WriteString(seg.style.Render(string(runes[seg.start:seg.end])))
+	}
+
+	return builder.String()
+}
+
+func sliceHighlights(highlights []diff.Highlight, start, end int) []diff.Highlight {
+	var sliced []diff.Highlight
+	for _, h := range highlights {
+		if h.End <= start || h.Start >= end {
+			continue
+		}
+		sliced = append(sliced, diff.Highlight{Start: max(h.Start-start, 0), End: min(h.End, end) - start})
+	}
+	return sliced
+}
+
+func offsetHighlights(highlights []diff.Highlight, delta int) []diff.Highlight {
+	if delta == 0 {
+		return highlights
+	}
+	adjusted := make([]diff.Highlight, len(highlights))
+	for i, h := range highlights {
+		adjusted[i] = diff.Highlight{Start: h.Start + delta, End: h.End + delta}
+	}
+	return adjusted
 }
 
 func (m *Model) adjustMinimapWidth(delta int) {
@@ -874,17 +982,22 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 	// Content
 	leftContent := ""
 	rightContent := ""
+	var leftHighlights, rightHighlights []diff.Highlight
 
 	switch line.Type {
 	case diff.Removed:
 		leftContent = "- " + line.Content
 		rightContent = ""
+		leftHighlights = offsetHighlights(line.Highlights, runeLen("- "))
 	case diff.Added:
 		leftContent = ""
 		rightContent = "+ " + line.Content
+		rightHighlights = offsetHighlights(line.Highlights, runeLen("+ "))
 	case diff.Equal:
 		leftContent = "  " + line.Content
 		rightContent = "  " + line.Content
+		leftHighlights = offsetHighlights(line.Highlights, runeLen("  "))
+		rightHighlights = leftHighlights
 	}
 
 	// Calculate content width based on whether line numbers are shown
@@ -898,35 +1011,25 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 		contentWidth = 10
 	}
 
-	// Safely truncate content to fit column width
-	if len(leftContent) > contentWidth && contentWidth > 3 {
-		leftContent = leftContent[:contentWidth-3] + "..."
-	} else if len(leftContent) > contentWidth {
-		if contentWidth > 0 {
-			leftContent = leftContent[:contentWidth]
-		} else {
-			leftContent = ""
-		}
-	}
+	leftSegments := m.renderInlineColumn(leftContent, leftHighlights, leftStyle, m.highlightStyleForLine(line), contentWidth)
+	rightSegments := m.renderInlineColumn(rightContent, rightHighlights, rightStyle, m.highlightStyleForLine(line), contentWidth)
 
-	if len(rightContent) > contentWidth && contentWidth > 3 {
-		rightContent = rightContent[:contentWidth-3] + "..."
-	} else if len(rightContent) > contentWidth {
-		if contentWidth > 0 {
-			rightContent = rightContent[:contentWidth]
-		} else {
-			rightContent = ""
-		}
-	}
-
-	// Pad to column width
-	leftContent = fmt.Sprintf("%-*s", contentWidth, leftContent)
-	rightContent = fmt.Sprintf("%-*s", contentWidth, rightContent)
-
-	leftParts = append(leftParts, leftStyle.Render(leftContent))
-	rightParts = append(rightParts, rightStyle.Render(rightContent))
+	leftParts = append(leftParts, leftSegments)
+	rightParts = append(rightParts, rightSegments)
 
 	return strings.Join(leftParts, ""), strings.Join(rightParts, "")
+}
+
+func (m Model) renderInlineColumn(content string, highlights []diff.Highlight, baseStyle, highlightStyle lipgloss.Style, width int) string {
+	if width < 1 {
+		return ""
+	}
+
+	truncated := truncateWidth(content, width)
+	padded := padRight(truncated, width)
+	localized := sliceHighlights(highlights, 0, runeLen(padded))
+
+	return applyHighlights(padded, localized, baseStyle, highlightStyle)
 }
 
 // renderLine renders a single diff line in unified mode

@@ -15,8 +15,9 @@ type Config struct {
 	ShowLineNo       bool
 	TabSize          int
 	IgnoreWhitespace bool
-	Spacing          SpacingOptions
-	Keybindings      Keybindings
+	IgnorePatterns   []string
+	Language         string
+	TokenPatterns    map[string]string
 }
 
 // ThemePreset describes a named theme configuration.
@@ -71,8 +72,9 @@ func DefaultConfig() *Config {
 		ShowLineNo:       true,
 		TabSize:          4,
 		IgnoreWhitespace: false,
-		Spacing:          DefaultSpacing(),
-		Keybindings:      DefaultKeybindings(),
+		IgnorePatterns:   []string{},
+		Language:         "",
+		TokenPatterns:    map[string]string{},
 	}
 }
 

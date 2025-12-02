@@ -18,6 +18,9 @@ var (
 	showVersion      bool
 	noLineNumber     bool
 	ignoreWhitespace bool
+	ignorePatterns   []string
+	language         string
+	tokenPatterns    map[string]string
 	tabSize          int
 	help             bool
 	ref1             string
@@ -29,6 +32,9 @@ func init() {
 	flag.BoolVarP(&showVersion, "version", "v", false, "Show version information")
 	flag.BoolVarP(&noLineNumber, "no-line-numbers", "n", false, "Hide line numbers")
 	flag.BoolVarP(&ignoreWhitespace, "ignore-whitespace", "w", false, "Ignore whitespace changes")
+	flag.StringArrayVar(&ignorePatterns, "ignore-pattern", nil, "Regex pattern to ignore from comparison (can be repeated)")
+	flag.StringVar(&language, "language", "", "Language or file extension hint for tokenization")
+	flag.StringToStringVar(&tokenPatterns, "tokenizer", map[string]string{}, "Override token regex per extension (e.g. .txt=\\w+)")
 	flag.IntVarP(&tabSize, "tab-size", "t", 4, "Set tab size")
 	flag.StringVar(&ref1, "ref1", "", "Git reference for the left side (defaults to HEAD if ref2 is set)")
 	flag.StringVar(&ref2, "ref2", "", "Git reference for the right side (defaults to working tree)")
@@ -223,7 +229,22 @@ func main() {
 	}
 
 	args := flag.Args()
-	engine := diff.NewEngine()
+
+	// Initialize configuration
+	cfg := config.DefaultConfig()
+	cfg.ShowLineNo = !noLineNumber
+	cfg.TabSize = tabSize
+	cfg.IgnoreWhitespace = ignoreWhitespace
+	cfg.IgnorePatterns = ignorePatterns
+	cfg.Language = language
+	cfg.TokenPatterns = tokenPatterns
+
+	engine := diff.NewEngine(diff.EngineOptions{
+		Language:         cfg.Language,
+		IgnoreWhitespace: cfg.IgnoreWhitespace,
+		IgnorePatterns:   cfg.IgnorePatterns,
+		TokenPatterns:    cfg.TokenPatterns,
+	})
 
 	gitDiffMode := ref1 != "" || ref2 != ""
 
@@ -270,12 +291,6 @@ func main() {
 			os.Exit(1)
 		}
 	}
-
-	// Initialize configuration
-	cfg := config.DefaultConfig()
-	cfg.ShowLineNo = !noLineNumber
-	cfg.TabSize = tabSize
-	cfg.IgnoreWhitespace = ignoreWhitespace
 
 	// If no changes, just report and exit
 	if !diffResult.HasChanges() {
