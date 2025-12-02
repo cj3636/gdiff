@@ -11,6 +11,9 @@ type Config struct {
 	ShowLineNo       bool
 	TabSize          int
 	IgnoreWhitespace bool
+	IgnorePatterns   []string
+	Language         string
+	TokenPatterns    map[string]string
 }
 
 // Theme defines the color scheme for the application
@@ -44,6 +47,9 @@ func DefaultConfig() *Config {
 		ShowLineNo:       true,
 		TabSize:          4,
 		IgnoreWhitespace: false,
+		IgnorePatterns:   []string{},
+		Language:         "",
+		TokenPatterns:    map[string]string{},
 	}
 }
 
