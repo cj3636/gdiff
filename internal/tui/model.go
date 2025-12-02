@@ -18,6 +18,9 @@ import (
 type Model struct {
 	diffResult       *diff.DiffResult
 	config           *config.Config
+	keybindings      config.Keybindings
+	overrideKeys     config.Keybindings
+	useOverrides     bool
 	diffEngine       *diff.Engine
 	renderedLines    []diff.DiffLine
 	styles           *Styles
@@ -39,6 +42,9 @@ type Model struct {
 	branchIndex      int
 	paletteEntries   []paletteEntry
 	paletteIndex     int
+	settingsEntries  []settingsEntry
+	settingsIndex    int
+	showSettings     bool
 	goToLineActive   bool
 	goToLineValue    string
 	goToLineError    string
@@ -51,6 +57,54 @@ type Model struct {
 	loadProgress     float64
 	statusMessage    string
 }
+
+type settingsEntry struct {
+	section     string
+	label       string
+	description string
+	action      settingsAction
+}
+
+type settingsAction int
+
+const (
+	settingsActionTheme settingsAction = iota
+	settingsActionContrast
+	settingsActionLineNumbers
+	settingsActionLineNumberWidth
+	settingsActionLinePadding
+	settingsActionLineSpacing
+	settingsActionKeybindings
+)
+
+const (
+	actionQuit              = "quit"
+	actionToggleHelp        = "toggle_help"
+	actionToggleStats       = "toggle_stats"
+	actionToggleStatus      = "toggle_status"
+	actionToggleBranches    = "toggle_branches"
+	actionToggleHistory     = "toggle_history"
+	actionTogglePalette     = "toggle_palette"
+	actionToggleSettings    = "toggle_settings"
+	actionToggleSideBySide  = "toggle_side_by_side"
+	actionToggleSyntax      = "toggle_syntax"
+	actionToggleWrap        = "toggle_wrap"
+	actionToggleBlame       = "toggle_blame"
+	actionToggleLineNumbers = "toggle_line_numbers"
+	actionMinimapNarrow     = "minimap_narrow"
+	actionMinimapWiden      = "minimap_widen"
+	actionNextChange        = "next_change"
+	actionPrevChange        = "prev_change"
+	actionScrollDown        = "scroll_down"
+	actionScrollUp          = "scroll_up"
+	actionPageDown          = "page_down"
+	actionPageUp            = "page_up"
+	actionGoTop             = "go_top"
+	actionGoBottom          = "go_bottom"
+	actionGoLine            = "go_line"
+	actionPrevBranch        = "prev_branch"
+	actionNextBranch        = "next_branch"
+)
 
 type paletteEntry struct {
 	section      string
@@ -70,6 +124,7 @@ const (
 	paletteActionToggleSyntax
 	paletteActionToggleBlame
 	paletteActionToggleWrap
+	paletteActionOpenSettings
 	paletteActionGoTop
 	paletteActionGoBottom
 	paletteActionGoToLine
@@ -145,11 +200,20 @@ func loadDiffChunkCmd(lines []diff.DiffLine, start, size int) tea.Cmd {
 
 // NewModel creates a new TUI model
 func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engine, gitCtx GitContext) Model {
-	styles := createStyles(cfg.Theme)
-	chunkSize := 500
+	if cfg.Keybindings == nil {
+		cfg.Keybindings = config.Keybindings{}
+	}
+
+	cfg.Theme = config.ThemeForPreset(cfg.ThemePreset, cfg.HighContrast)
+
+	styles := createStyles(cfg)
+	overrides := copyKeybindings(cfg.Keybindings)
 	model := Model{
 		diffResult:       diffResult,
 		config:           cfg,
+		keybindings:      config.MergeKeybindings(overrides),
+		overrideKeys:     overrides,
+		useOverrides:     len(overrides) > 0,
 		diffEngine:       engine,
 		styles:           styles,
 		viewport:         Viewport{offset: 0, height: 20},
@@ -189,23 +253,34 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 	}
 
 	model.refreshPaletteEntries()
+	model.refreshSettingsEntries()
 	return model
 }
 
 // createStyles initializes all lipgloss styles based on theme
-func createStyles(theme config.Theme) *Styles {
+func createStyles(cfg *config.Config) *Styles {
+	theme := cfg.Theme
+	padding := cfg.Spacing.LinePadding
+	gutterWidth := cfg.Spacing.LineNumberWidth
+	if gutterWidth < 4 {
+		gutterWidth = 4
+	}
+
 	return &Styles{
 		added: lipgloss.NewStyle().
 			Foreground(theme.AddedFg).
-			Background(theme.AddedBg),
+			Background(theme.AddedBg).
+			Padding(0, padding),
 		removed: lipgloss.NewStyle().
 			Foreground(theme.RemovedFg).
-			Background(theme.RemovedBg),
+			Background(theme.RemovedBg).
+			Padding(0, padding),
 		unchanged: lipgloss.NewStyle().
-			Foreground(theme.UnchangedFg),
+			Foreground(theme.UnchangedFg).
+			Padding(0, padding),
 		lineNumber: lipgloss.NewStyle().
 			Foreground(theme.LineNumberFg).
-			Width(6).
+			Width(gutterWidth).
 			Align(lipgloss.Right),
 		border: lipgloss.NewStyle().
 			BorderStyle(lipgloss.NormalBorder()).
@@ -275,57 +350,66 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		switch msg.String() {
-		case "ctrl+c", "q":
+		if m.showSettings {
+			m.handleSettingsInput(msg)
+			return m, nil
+		}
+
+		switch {
+		case m.matchesKey(actionQuit, msg):
 			return m, tea.Quit
-		case "?", "h":
+		case m.matchesKey(actionToggleHelp, msg):
 			m.togglePanel(helpPanel)
-		case "s":
+		case m.matchesKey(actionToggleStats, msg):
 			m.togglePanel(statsPanel)
-		case "S":
+		case m.matchesKey(actionToggleStatus, msg):
 			m.togglePanel(statusPanel)
-		case "B":
+		case m.matchesKey(actionToggleBranches, msg):
 			m.togglePanel(branchPanel)
-		case "H":
+		case m.matchesKey(actionToggleHistory, msg):
 			m.togglePanel(historyPanel)
-		case "p":
+		case m.matchesKey(actionTogglePalette, msg):
 			m.toggleCommandPalette()
-		case "v":
+		case m.matchesKey(actionToggleSettings, msg):
+			m.toggleSettings()
+		case m.matchesKey(actionToggleSideBySide, msg):
 			m.sideBySideMode = !m.sideBySideMode
-		case "c":
+		case m.matchesKey(actionToggleSyntax, msg):
 			m.syntaxHighlight = !m.syntaxHighlight
-		case "w":
+		case m.matchesKey(actionToggleWrap, msg):
 			m.wrapLines = !m.wrapLines
-		case "b":
+		case m.matchesKey(actionToggleBlame, msg):
 			m.showBlame = !m.showBlame
 			if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
 				m.gitCtx.Blame, m.err = m.collectBlame()
 			}
-		case "<":
+		case m.matchesKey(actionToggleLineNumbers, msg):
+			m.config.ShowLineNo = !m.config.ShowLineNo
+		case m.matchesKey(actionMinimapNarrow, msg):
 			m.adjustMinimapWidth(-2)
-		case ">":
+		case m.matchesKey(actionMinimapWiden, msg):
 			m.adjustMinimapWidth(2)
-		case "n":
+		case m.matchesKey(actionNextChange, msg):
 			m.jumpToNextChange()
-		case "N":
+		case m.matchesKey(actionPrevChange, msg):
 			m.jumpToPreviousChange()
-		case "j", "down":
+		case m.matchesKey(actionScrollDown, msg):
 			m.scrollDown()
-		case "k", "up":
+		case m.matchesKey(actionScrollUp, msg):
 			m.scrollUp()
-		case "d":
+		case m.matchesKey(actionPageDown, msg):
 			m.scrollPageDown()
-		case "u":
+		case m.matchesKey(actionPageUp, msg):
 			m.scrollPageUp()
-		case "g":
+		case m.matchesKey(actionGoTop, msg):
 			m.scrollToTop()
-		case "G":
+		case m.matchesKey(actionGoBottom, msg):
 			m.scrollToBottom()
-		case "L":
+		case m.matchesKey(actionGoLine, msg):
 			m.openGoToLineDialog()
-		case "[":
+		case m.matchesKey(actionPrevBranch, msg):
 			m.selectPreviousBranch()
-		case "]":
+		case m.matchesKey(actionNextBranch, msg):
 			m.selectNextBranch()
 		}
 
@@ -365,6 +449,10 @@ func (m Model) View() string {
 
 	if m.showCommand {
 		sections = append(sections, m.renderCommandPalette())
+	}
+
+	if m.showSettings {
+		sections = append(sections, m.renderSettingsModal())
 	}
 
 	if m.goToLineActive {
@@ -454,6 +542,9 @@ func (m Model) renderUnifiedLines(start, end, contentWidth int, diffLines []diff
 		for _, part := range wrapped {
 			trimmed := truncateWidth(part, available)
 			lines = append(lines, prefix+style.Render(trimmed))
+			for s := 0; s < m.config.Spacing.LineSpacing; s++ {
+				lines = append(lines, "")
+			}
 		}
 	}
 
@@ -479,6 +570,9 @@ func (m Model) renderSideBySideLines(start, end, contentWidth int, diffLines []d
 		}
 
 		lines = append(lines, truncateWidth(combinedLine, contentWidth))
+		for s := 0; s < m.config.Spacing.LineSpacing; s++ {
+			lines = append(lines, "")
+		}
 	}
 
 	return lines
@@ -565,18 +659,7 @@ func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style
 	var parts []string
 
 	if m.config.ShowLineNo {
-		lineNo1 := " "
-		lineNo2 := " "
-		if line.LineNo1 > 0 {
-			lineNo1 = fmt.Sprintf("%5d", line.LineNo1)
-		} else {
-			lineNo1 = "     "
-		}
-		if line.LineNo2 > 0 {
-			lineNo2 = fmt.Sprintf("%5d", line.LineNo2)
-		} else {
-			lineNo2 = "     "
-		}
+		lineNo1, lineNo2 := m.lineNumberStrings(line)
 		parts = append(parts, m.styles.lineNumber.Render(lineNo1))
 		parts = append(parts, m.styles.lineNumber.Render(lineNo2))
 		parts = append(parts, " ")
@@ -783,14 +866,7 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 
 	// Line numbers
 	if m.config.ShowLineNo {
-		lineNo1 := "     "
-		lineNo2 := "     "
-		if line.LineNo1 > 0 {
-			lineNo1 = fmt.Sprintf("%5d", line.LineNo1)
-		}
-		if line.LineNo2 > 0 {
-			lineNo2 = fmt.Sprintf("%5d", line.LineNo2)
-		}
+		lineNo1, lineNo2 := m.lineNumberStrings(line)
 		leftParts = append(leftParts, m.styles.lineNumber.Render(lineNo1)+" ")
 		rightParts = append(rightParts, m.styles.lineNumber.Render(lineNo2)+" ")
 	}
@@ -814,7 +890,7 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 	// Calculate content width based on whether line numbers are shown
 	contentWidth := columnWidth
 	if m.config.ShowLineNo {
-		contentWidth = columnWidth - 8 // Account for line numbers (5 digits + 1 space + padding)
+		contentWidth = columnWidth - (m.lineNumberGutterWidth() + 1)
 	}
 
 	// Ensure minimum width
@@ -859,18 +935,7 @@ func (m Model) renderLine(line diff.DiffLine) string {
 
 	// Line numbers
 	if m.config.ShowLineNo {
-		lineNo1 := " "
-		lineNo2 := " "
-		if line.LineNo1 > 0 {
-			lineNo1 = fmt.Sprintf("%5d", line.LineNo1)
-		} else {
-			lineNo1 = "     "
-		}
-		if line.LineNo2 > 0 {
-			lineNo2 = fmt.Sprintf("%5d", line.LineNo2)
-		} else {
-			lineNo2 = "     "
-		}
+		lineNo1, lineNo2 := m.lineNumberStrings(line)
 		parts = append(parts, m.styles.lineNumber.Render(lineNo1))
 		parts = append(parts, m.styles.lineNumber.Render(lineNo2))
 		parts = append(parts, " ")
@@ -945,16 +1010,26 @@ func (m Model) renderStatusBar() string {
 		wrapMode = "on"
 	}
 
+	lineNumbers := "off"
+	if m.config.ShowLineNo {
+		lineNumbers = "on"
+	}
+
+	themeLabel := string(m.config.ThemePreset)
+	if m.config.HighContrast {
+		themeLabel += "+hc"
+	}
+
 	gitInfo := ""
 	if m.gitCtx.Enabled {
 		gitInfo = fmt.Sprintf(" | git: %s→%s", m.gitCtx.Ref1, m.gitCtx.Ref2)
 	}
 
 	status := fmt.Sprintf(
-		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Wrap: %s | Color: %s%s",
+		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Wrap: %s | Color: %s | Theme: %s | Ln: %s | pad:%d space:%d%s | %s settings",
 		added, removed, unchanged,
-		m.viewport.offset+1, max(totalLines, 1),
-		viewMode, wrapMode, syntaxMode, gitInfo,
+		m.viewport.offset+1, len(m.diffResult.Lines),
+		viewMode, wrapMode, syntaxMode, themeLabel, lineNumbers, m.config.Spacing.LinePadding, m.config.Spacing.LineSpacing, gitInfo, m.keyDisplay(actionToggleSettings),
 	)
 
 	if m.loading {
@@ -1018,17 +1093,17 @@ func (m Model) renderActivePanel() string {
 
 // renderHelpPanel renders the help panel below the main view
 func (m Model) renderHelpPanel() string {
-	helpText := []string{
+	helps := []string{
 		"",
 		"Keyboard Shortcuts:",
-		"  j, ↓      Scroll down     │  g         Go to top        │  v    Toggle side-by-side",
-		"  k, ↑      Scroll up       │  G         Go to bottom     │  c    Toggle syntax colors",
-		"  d         Half page down  │  s         Toggle stats     │  b    Toggle blame",
-		"  u         Half page up    │  w         Toggle wrapping  │  q    Quit",
-		"  p         Command palette │  L         Go to line       │  g↵   Palette go-to-line",
-		"  S         Git status      │  B         Branch switcher  │  H    Commit history",
-		"  [ / ]     Cycle branches  │  < / >     Resize minimap",
-		"  n / N     Next/prev change│  Mouse     Jump via minimap",
+		fmt.Sprintf("  %-10s Scroll down     │  %-10s Go to top        │  %-6s Toggle side-by-side", m.keyDisplay(actionScrollDown), m.keyDisplay(actionGoTop), m.keyDisplay(actionToggleSideBySide)),
+		fmt.Sprintf("  %-10s Scroll up       │  %-10s Go to bottom     │  %-6s Toggle syntax colors", m.keyDisplay(actionScrollUp), m.keyDisplay(actionGoBottom), m.keyDisplay(actionToggleSyntax)),
+		fmt.Sprintf("  %-10s Half page down  │  %-10s Toggle stats     │  %-6s Toggle blame", m.keyDisplay(actionPageDown), m.keyDisplay(actionToggleStats), m.keyDisplay(actionToggleBlame)),
+		fmt.Sprintf("  %-10s Half page up    │  %-10s Toggle wrapping  │  %-6s Quit", m.keyDisplay(actionPageUp), m.keyDisplay(actionToggleWrap), m.keyDisplay(actionQuit)),
+		fmt.Sprintf("  %-10s Command palette │  %-10s Go to line       │  %-6s Settings", m.keyDisplay(actionTogglePalette), m.keyDisplay(actionGoLine), m.keyDisplay(actionToggleSettings)),
+		fmt.Sprintf("  %-10s Git status      │  %-10s Branch switcher  │  %-6s Commit history", m.keyDisplay(actionToggleStatus), m.keyDisplay(actionToggleBranches), m.keyDisplay(actionToggleHistory)),
+		fmt.Sprintf("  %-10s Cycle branches  │  %-10s Resize minimap", m.keyDisplay(actionPrevBranch)+" / "+m.keyDisplay(actionNextBranch), m.keyDisplay(actionMinimapNarrow)+" / "+m.keyDisplay(actionMinimapWiden)),
+		fmt.Sprintf("  %-10s Next/prev change│  Mouse     Jump via minimap", m.keyDisplay(actionNextChange)+" / "+m.keyDisplay(actionPrevChange)),
 		"",
 	}
 
@@ -1039,7 +1114,7 @@ func (m Model) renderHelpPanel() string {
 		Padding(0, 1).
 		Width(m.width - 2)
 
-	return helpStyle.Render(strings.Join(helpText, "\n"))
+	return helpStyle.Render(strings.Join(helps, "\n"))
 }
 
 func (m Model) renderCommandPalette() string {
@@ -1074,6 +1149,180 @@ func (m Model) renderCommandPalette() string {
 		Width(m.width - 2)
 
 	return style.Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) renderSettingsModal() string {
+	if len(m.settingsEntries) == 0 {
+		return ""
+	}
+
+	currentSection := ""
+	var lines []string
+	lines = append(lines, " Settings")
+
+	for i, entry := range m.settingsEntries {
+		if entry.section != currentSection {
+			lines = append(lines, "")
+			lines = append(lines, m.styles.section.Render(entry.section))
+			currentSection = entry.section
+		}
+
+		value := m.settingDescription(entry)
+		label := fmt.Sprintf("%s  %s", entry.label, value)
+		if i == m.settingsIndex {
+			label = m.styles.selection.Render("> " + label)
+		} else {
+			label = "  " + label
+		}
+		lines = append(lines, label)
+	}
+
+	style := m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2)
+
+	return style.Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) toggleSettings() {
+	m.showSettings = !m.showSettings
+	if m.showSettings {
+		m.showCommand = false
+		m.goToLineActive = false
+		m.refreshSettingsEntries()
+	} else {
+		m.settingsIndex = 0
+	}
+	m.updateViewportHeight()
+}
+
+func (m *Model) refreshSettingsEntries() {
+	m.settingsEntries = []settingsEntry{
+		{section: "Theme", label: "Preset", action: settingsActionTheme},
+		{section: "Theme", label: "High contrast", action: settingsActionContrast},
+		{section: "Layout", label: "Line numbers", action: settingsActionLineNumbers},
+		{section: "Layout", label: "Line number width", action: settingsActionLineNumberWidth},
+		{section: "Layout", label: "Line padding", action: settingsActionLinePadding},
+		{section: "Layout", label: "Line spacing", action: settingsActionLineSpacing},
+		{section: "Input", label: "Keybindings", action: settingsActionKeybindings},
+	}
+
+	if m.settingsIndex >= len(m.settingsEntries) {
+		m.settingsIndex = max(0, len(m.settingsEntries)-1)
+	}
+}
+
+func (m Model) settingDescription(entry settingsEntry) string {
+	switch entry.action {
+	case settingsActionTheme:
+		return string(m.config.ThemePreset)
+	case settingsActionContrast:
+		if m.config.HighContrast {
+			return "On"
+		}
+		return "Off"
+	case settingsActionLineNumbers:
+		if m.config.ShowLineNo {
+			return "Shown"
+		}
+		return "Hidden"
+	case settingsActionLineNumberWidth:
+		return fmt.Sprintf("%d cols", m.config.Spacing.LineNumberWidth)
+	case settingsActionLinePadding:
+		return fmt.Sprintf("%d spaces", m.config.Spacing.LinePadding)
+	case settingsActionLineSpacing:
+		return fmt.Sprintf("%d extra", m.config.Spacing.LineSpacing)
+	case settingsActionKeybindings:
+		if len(m.overrideKeys) == 0 {
+			return "Defaults"
+		}
+		if m.useOverrides {
+			return "Overrides"
+		}
+		return "Defaults"
+	default:
+		return ""
+	}
+}
+
+func (m *Model) handleSettingsInput(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "esc":
+		m.showSettings = false
+		m.updateViewportHeight()
+		return
+	case "up", "k":
+		m.settingsIndex--
+		if m.settingsIndex < 0 {
+			m.settingsIndex = 0
+		}
+	case "down", "j":
+		m.settingsIndex++
+		if m.settingsIndex >= len(m.settingsEntries) {
+			m.settingsIndex = len(m.settingsEntries) - 1
+		}
+	case "left", "h":
+		m.applySettingsAction(-1)
+	case "right", "l", "enter", " ":
+		m.applySettingsAction(1)
+	}
+}
+
+func (m *Model) applySettingsAction(direction int) {
+	if len(m.settingsEntries) == 0 {
+		return
+	}
+
+	entry := m.settingsEntries[m.settingsIndex]
+	switch entry.action {
+	case settingsActionTheme:
+		presets := []config.ThemePreset{config.PresetDefault, config.PresetSolarize, config.PresetDracula}
+		idx := 0
+		for i, p := range presets {
+			if p == m.config.ThemePreset {
+				idx = i
+				break
+			}
+		}
+		idx = (idx + direction + len(presets)) % len(presets)
+		m.config.ThemePreset = presets[idx]
+		m.applyTheme()
+	case settingsActionContrast:
+		m.config.HighContrast = !m.config.HighContrast
+		m.applyTheme()
+	case settingsActionLineNumbers:
+		m.config.ShowLineNo = !m.config.ShowLineNo
+	case settingsActionLineNumberWidth:
+		options := []int{4, 6, 8}
+		m.config.Spacing.LineNumberWidth = cycleInt(options, m.config.Spacing.LineNumberWidth, direction)
+		m.refreshStyles()
+	case settingsActionLinePadding:
+		options := []int{0, 1, 2}
+		m.config.Spacing.LinePadding = cycleInt(options, m.config.Spacing.LinePadding, direction)
+		m.refreshStyles()
+	case settingsActionLineSpacing:
+		options := []int{0, 1, 2}
+		m.config.Spacing.LineSpacing = cycleInt(options, m.config.Spacing.LineSpacing, direction)
+	case settingsActionKeybindings:
+		if len(m.overrideKeys) == 0 {
+			m.keybindings = config.DefaultKeybindings()
+			m.useOverrides = false
+			m.config.Keybindings = config.Keybindings{}
+			break
+		}
+		m.useOverrides = !m.useOverrides
+		if m.useOverrides {
+			m.keybindings = config.MergeKeybindings(m.overrideKeys)
+			m.config.Keybindings = copyKeybindings(m.overrideKeys)
+		} else {
+			m.keybindings = config.DefaultKeybindings()
+			m.config.Keybindings = config.Keybindings{}
+		}
+	}
+
+	m.refreshSettingsEntries()
 }
 
 func (m Model) renderGoToLineDialog() string {
@@ -1249,6 +1498,8 @@ func (m *Model) executePaletteSelection() {
 		}
 	case paletteActionToggleWrap:
 		m.wrapLines = !m.wrapLines
+	case paletteActionOpenSettings:
+		m.toggleSettings()
 	case paletteActionGoTop:
 		m.scrollToTop()
 	case paletteActionGoBottom:
@@ -1275,6 +1526,7 @@ func (m *Model) refreshPaletteEntries() {
 		paletteEntry{section: "Commands", label: "Toggle side-by-side", description: "v", action: paletteActionToggleSideBySide},
 		paletteEntry{section: "Commands", label: "Toggle syntax colors", description: "c", action: paletteActionToggleSyntax},
 		paletteEntry{section: "Commands", label: "Toggle wrapping", description: "w", action: paletteActionToggleWrap},
+		paletteEntry{section: "Commands", label: "Settings", description: ",", action: paletteActionOpenSettings},
 		paletteEntry{section: "Commands", label: "Toggle blame", description: "b", action: paletteActionToggleBlame},
 		paletteEntry{section: "Commands", label: "Go to top", description: "g", action: paletteActionGoTop},
 		paletteEntry{section: "Commands", label: "Go to bottom", description: "G", action: paletteActionGoBottom},
@@ -1373,6 +1625,7 @@ func (m *Model) openGoToLineDialog() {
 	m.goToLineActive = true
 	m.goToLineValue = ""
 	m.goToLineError = ""
+	m.showSettings = false
 	m.showCommand = false
 	m.updateViewportHeight()
 }
@@ -1628,6 +1881,10 @@ func (m *Model) updateViewportHeight() {
 		baseHeight -= min(m.commandHeight, len(m.paletteEntries)+4)
 	}
 
+	if m.showSettings {
+		baseHeight -= min(8, len(m.settingsEntries)+4)
+	}
+
 	if m.goToLineActive {
 		baseHeight -= 3
 	}
@@ -1638,6 +1895,73 @@ func (m *Model) updateViewportHeight() {
 	}
 
 	m.viewport.height = baseHeight
+}
+
+func (m Model) matchesKey(action string, msg tea.KeyMsg) bool {
+	keys := m.keybindings[action]
+	if len(keys) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		if msg.String() == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Model) keyDisplay(action string) string {
+	keys := m.keybindings[action]
+	if len(keys) == 0 {
+		return ""
+	}
+	return strings.Join(keys, "/")
+}
+
+func (m Model) lineNumberGutterWidth() int {
+	width := m.config.Spacing.LineNumberWidth
+	if width < 4 {
+		width = 4
+	}
+	return width
+}
+
+func (m Model) lineNumberStrings(line diff.DiffLine) (string, string) {
+	width := m.lineNumberGutterWidth() - 1
+	if width < 2 {
+		width = 2
+	}
+	blank := strings.Repeat(" ", width)
+	format := fmt.Sprintf("%%%dd", width)
+
+	lineNo1 := blank
+	lineNo2 := blank
+	if line.LineNo1 > 0 {
+		lineNo1 = fmt.Sprintf(format, line.LineNo1)
+	}
+	if line.LineNo2 > 0 {
+		lineNo2 = fmt.Sprintf(format, line.LineNo2)
+	}
+	return lineNo1, lineNo2
+}
+
+func (m *Model) applyTheme() {
+	m.config.Theme = config.ThemeForPreset(m.config.ThemePreset, m.config.HighContrast)
+	m.refreshStyles()
+}
+
+func (m *Model) refreshStyles() {
+	m.styles = createStyles(m.config)
+}
+
+func copyKeybindings(src config.Keybindings) config.Keybindings {
+	dup := config.Keybindings{}
+	for action, keys := range src {
+		copied := make([]string, len(keys))
+		copy(copied, keys)
+		dup[action] = copied
+	}
+	return dup
 }
 
 // Utility functions
@@ -1653,6 +1977,21 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func cycleInt(options []int, current int, direction int) int {
+	if len(options) == 0 {
+		return current
+	}
+	idx := 0
+	for i, v := range options {
+		if v == current {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + direction + len(options)) % len(options)
+	return options[idx]
 }
 
 func truncate(s string, maxLen int) string {
