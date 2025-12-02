@@ -19,7 +19,11 @@ import (
 type Model struct {
 	diffResult       *diff.DiffResult
 	config           *config.Config
+	keybindings      config.Keybindings
+	overrideKeys     config.Keybindings
+	useOverrides     bool
 	diffEngine       *diff.Engine
+	renderedLines    []diff.DiffLine
 	styles           *Styles
 	viewport         Viewport
 	width            int
@@ -39,6 +43,9 @@ type Model struct {
 	branchIndex      int
 	paletteEntries   []paletteEntry
 	paletteIndex     int
+	settingsEntries  []settingsEntry
+	settingsIndex    int
+	showSettings     bool
 	goToLineActive   bool
 	goToLineValue    string
 	goToLineError    string
@@ -48,6 +55,54 @@ type Model struct {
 	minimapHeight    int
 	statusMessage    string
 }
+
+type settingsEntry struct {
+	section     string
+	label       string
+	description string
+	action      settingsAction
+}
+
+type settingsAction int
+
+const (
+	settingsActionTheme settingsAction = iota
+	settingsActionContrast
+	settingsActionLineNumbers
+	settingsActionLineNumberWidth
+	settingsActionLinePadding
+	settingsActionLineSpacing
+	settingsActionKeybindings
+)
+
+const (
+	actionQuit              = "quit"
+	actionToggleHelp        = "toggle_help"
+	actionToggleStats       = "toggle_stats"
+	actionToggleStatus      = "toggle_status"
+	actionToggleBranches    = "toggle_branches"
+	actionToggleHistory     = "toggle_history"
+	actionTogglePalette     = "toggle_palette"
+	actionToggleSettings    = "toggle_settings"
+	actionToggleSideBySide  = "toggle_side_by_side"
+	actionToggleSyntax      = "toggle_syntax"
+	actionToggleWrap        = "toggle_wrap"
+	actionToggleBlame       = "toggle_blame"
+	actionToggleLineNumbers = "toggle_line_numbers"
+	actionMinimapNarrow     = "minimap_narrow"
+	actionMinimapWiden      = "minimap_widen"
+	actionNextChange        = "next_change"
+	actionPrevChange        = "prev_change"
+	actionScrollDown        = "scroll_down"
+	actionScrollUp          = "scroll_up"
+	actionPageDown          = "page_down"
+	actionPageUp            = "page_up"
+	actionGoTop             = "go_top"
+	actionGoBottom          = "go_bottom"
+	actionGoLine            = "go_line"
+	actionPrevBranch        = "prev_branch"
+	actionNextBranch        = "next_branch"
+)
 
 type paletteEntry struct {
 	section      string
@@ -68,6 +123,7 @@ const (
 	paletteActionToggleSyntax
 	paletteActionToggleBlame
 	paletteActionToggleWrap
+	paletteActionOpenSettings
 	paletteActionGoTop
 	paletteActionGoBottom
 	paletteActionGoToLine
@@ -75,6 +131,14 @@ const (
 	paletteActionCopyDiff
 	paletteActionSaveDiff
 )
+
+type diffChunkMsg struct {
+	lines     []diff.DiffLine
+	nextStart int
+	total     int
+	done      bool
+	progress  float64
+}
 
 type panelType int
 
@@ -99,6 +163,8 @@ type Styles struct {
 	removed    lipgloss.Style
 	unchanged  lipgloss.Style
 	lineNumber lipgloss.Style
+	inlineAdd  lipgloss.Style
+	inlineDel  lipgloss.Style
 	border     lipgloss.Style
 	title      lipgloss.Style
 	help       lipgloss.Style
@@ -110,12 +176,47 @@ type Styles struct {
 	minimapDel lipgloss.Style
 }
 
+func loadDiffChunkCmd(lines []diff.DiffLine, start, size int) tea.Cmd {
+	return func() tea.Msg {
+		if start >= len(lines) {
+			return diffChunkMsg{done: true, progress: 1}
+		}
+
+		end := start + size
+		if end > len(lines) {
+			end = len(lines)
+		}
+
+		chunk := make([]diff.DiffLine, end-start)
+		copy(chunk, lines[start:end])
+
+		progress := float64(end) / float64(max(len(lines), 1))
+		return diffChunkMsg{
+			lines:     chunk,
+			nextStart: end,
+			total:     len(lines),
+			done:      end >= len(lines),
+			progress:  progress,
+		}
+	}
+}
+
 // NewModel creates a new TUI model
 func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engine, gitCtx GitContext) Model {
-	styles := createStyles(cfg.Theme)
+	if cfg.Keybindings == nil {
+		cfg.Keybindings = config.Keybindings{}
+	}
+
+	cfg.Theme = config.ThemeForPreset(cfg.ThemePreset, cfg.HighContrast)
+
+	styles := createStyles(cfg)
+	overrides := copyKeybindings(cfg.Keybindings)
 	model := Model{
 		diffResult:       diffResult,
 		config:           cfg,
+		keybindings:      config.MergeKeybindings(overrides),
+		overrideKeys:     overrides,
+		useOverrides:     len(overrides) > 0,
 		diffEngine:       engine,
 		styles:           styles,
 		viewport:         Viewport{offset: 0, height: 20},
@@ -131,6 +232,7 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 		gitCtx:           gitCtx,
 		wrapLines:        false,
 		minimapWidth:     14,
+		chunkSize:        chunkSize,
 	}
 
 	if gitCtx.Enabled {
@@ -142,24 +244,51 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 		}
 	}
 
+	if diffResult != nil {
+		if len(diffResult.Lines) == 0 {
+			model.statusMessage = "Diff loaded"
+			model.loadProgress = 1
+			model.renderedLines = diffResult.Lines
+		} else {
+			model.loading = true
+			model.statusMessage = "Loading diff..."
+		}
+	}
+
 	model.refreshPaletteEntries()
+	model.refreshSettingsEntries()
 	return model
 }
 
 // createStyles initializes all lipgloss styles based on theme
-func createStyles(theme config.Theme) *Styles {
+func createStyles(cfg *config.Config) *Styles {
+	theme := cfg.Theme
+	padding := cfg.Spacing.LinePadding
+	gutterWidth := cfg.Spacing.LineNumberWidth
+	if gutterWidth < 4 {
+		gutterWidth = 4
+	}
+
 	return &Styles{
 		added: lipgloss.NewStyle().
 			Foreground(theme.AddedFg).
-			Background(theme.AddedBg),
+			Background(theme.AddedBg).
+			Padding(0, padding),
 		removed: lipgloss.NewStyle().
 			Foreground(theme.RemovedFg).
-			Background(theme.RemovedBg),
+			Background(theme.RemovedBg).
+			Padding(0, padding),
 		unchanged: lipgloss.NewStyle().
 			Foreground(theme.UnchangedFg),
+		inlineAdd: lipgloss.NewStyle().
+			Foreground(theme.AddedFg).
+			Background(theme.AddedBg).Bold(true),
+		inlineDel: lipgloss.NewStyle().
+			Foreground(theme.RemovedFg).
+			Background(theme.RemovedBg).Bold(true),
 		lineNumber: lipgloss.NewStyle().
 			Foreground(theme.LineNumberFg).
-			Width(6).
+			Width(gutterWidth).
 			Align(lipgloss.Right),
 		border: lipgloss.NewStyle().
 			BorderStyle(lipgloss.NormalBorder()).
@@ -193,12 +322,31 @@ func createStyles(theme config.Theme) *Styles {
 
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
+	if m.diffResult != nil && len(m.diffResult.Lines) > 0 {
+		return loadDiffChunkCmd(m.diffResult.Lines, 0, m.chunkSize)
+	}
+
 	return nil
 }
 
 // Update handles messages and updates the model
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case diffChunkMsg:
+		m.renderedLines = append(m.renderedLines, msg.lines...)
+		m.loadProgress = msg.progress
+		m.loading = !msg.done
+
+		if msg.done {
+			m.statusMessage = "Diff loaded"
+			if len(m.renderedLines) == 0 && m.diffResult != nil {
+				m.renderedLines = m.diffResult.Lines
+			}
+		} else {
+			m.statusMessage = fmt.Sprintf("Loading diff... %d%%", int(msg.progress*100))
+			return m, loadDiffChunkCmd(m.diffResult.Lines, msg.nextStart, m.chunkSize)
+		}
+
 	case tea.KeyMsg:
 		if m.goToLineActive {
 			m.handleGoToLineInput(msg)
@@ -210,28 +358,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		switch msg.String() {
-		case "ctrl+c", "q":
+		if m.showSettings {
+			m.handleSettingsInput(msg)
+			return m, nil
+		}
+
+		switch {
+		case m.matchesKey(actionQuit, msg):
 			return m, tea.Quit
-		case "?", "h":
+		case m.matchesKey(actionToggleHelp, msg):
 			m.togglePanel(helpPanel)
-		case "s":
+		case m.matchesKey(actionToggleStats, msg):
 			m.togglePanel(statsPanel)
-		case "S":
+		case m.matchesKey(actionToggleStatus, msg):
 			m.togglePanel(statusPanel)
-		case "B":
+		case m.matchesKey(actionToggleBranches, msg):
 			m.togglePanel(branchPanel)
-		case "H":
+		case m.matchesKey(actionToggleHistory, msg):
 			m.togglePanel(historyPanel)
-		case "p":
+		case m.matchesKey(actionTogglePalette, msg):
 			m.toggleCommandPalette()
-		case "v":
+		case m.matchesKey(actionToggleSettings, msg):
+			m.toggleSettings()
+		case m.matchesKey(actionToggleSideBySide, msg):
 			m.sideBySideMode = !m.sideBySideMode
-		case "c":
+		case m.matchesKey(actionToggleSyntax, msg):
 			m.syntaxHighlight = !m.syntaxHighlight
-		case "w":
+		case m.matchesKey(actionToggleWrap, msg):
 			m.wrapLines = !m.wrapLines
-		case "b":
+		case m.matchesKey(actionToggleBlame, msg):
 			m.showBlame = !m.showBlame
 			if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
 				m.gitCtx.Blame, m.err = m.collectBlame()
@@ -242,29 +397,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.saveDiff(export.FormatHTML)
 		case "<":
 			m.adjustMinimapWidth(-2)
-		case ">":
+		case m.matchesKey(actionMinimapWiden, msg):
 			m.adjustMinimapWidth(2)
-		case "n":
+		case m.matchesKey(actionNextChange, msg):
 			m.jumpToNextChange()
-		case "N":
+		case m.matchesKey(actionPrevChange, msg):
 			m.jumpToPreviousChange()
-		case "j", "down":
+		case m.matchesKey(actionScrollDown, msg):
 			m.scrollDown()
-		case "k", "up":
+		case m.matchesKey(actionScrollUp, msg):
 			m.scrollUp()
-		case "d":
+		case m.matchesKey(actionPageDown, msg):
 			m.scrollPageDown()
-		case "u":
+		case m.matchesKey(actionPageUp, msg):
 			m.scrollPageUp()
-		case "g":
+		case m.matchesKey(actionGoTop, msg):
 			m.scrollToTop()
-		case "G":
+		case m.matchesKey(actionGoBottom, msg):
 			m.scrollToBottom()
-		case "L":
+		case m.matchesKey(actionGoLine, msg):
 			m.openGoToLineDialog()
-		case "[":
+		case m.matchesKey(actionPrevBranch, msg):
 			m.selectPreviousBranch()
-		case "]":
+		case m.matchesKey(actionNextBranch, msg):
 			m.selectNextBranch()
 		}
 
@@ -306,6 +461,10 @@ func (m Model) View() string {
 		sections = append(sections, m.renderCommandPalette())
 	}
 
+	if m.showSettings {
+		sections = append(sections, m.renderSettingsModal())
+	}
+
 	if m.goToLineActive {
 		sections = append(sections, m.renderGoToLineDialog())
 	}
@@ -332,26 +491,31 @@ func (m Model) renderTitle() string {
 
 // renderDiff renders the diff content
 func (m Model) renderDiff() string {
+	diffLines := m.currentLines()
+
 	// Calculate visible range
 	start := m.viewport.offset
-	end := min(start+m.viewport.height, len(m.diffResult.Lines))
+	end := min(start+m.viewport.height, len(diffLines))
 
-	if start >= len(m.diffResult.Lines) {
-		start = max(0, len(m.diffResult.Lines)-m.viewport.height)
+	if start >= len(diffLines) {
+		start = max(0, len(diffLines)-m.viewport.height)
 		m.viewport.offset = start
-		end = len(m.diffResult.Lines)
+		end = len(diffLines)
 	}
 
-	if start >= end || len(m.diffResult.Lines) == 0 {
+	if start >= end || len(diffLines) == 0 {
+		if m.loading && m.statusMessage != "" {
+			return m.styles.unchanged.Render(m.statusMessage)
+		}
 		return m.styles.unchanged.Render("No differences found.")
 	}
 
 	contentWidth := m.availableContentWidth()
 	var lines []string
 	if m.sideBySideMode {
-		lines = m.renderSideBySideLines(start, end, contentWidth)
+		lines = m.renderSideBySideLines(start, end, contentWidth, diffLines)
 	} else {
-		lines = m.renderUnifiedLines(start, end, contentWidth)
+		lines = m.renderUnifiedLines(start, end, contentWidth, diffLines)
 	}
 
 	lines = m.padLines(lines, m.viewport.height)
@@ -370,28 +534,34 @@ func (m *Model) availableContentWidth() int {
 	return width
 }
 
-func (m Model) renderUnifiedLines(start, end, contentWidth int) []string {
+func (m Model) renderUnifiedLines(start, end, contentWidth int, diffLines []diff.DiffLine) []string {
 	var lines []string
 
 	for i := start; i < end; i++ {
-		prefix, style, content := m.buildUnifiedLineParts(m.diffResult.Lines[i])
+		prefix, style, content, highlights := m.buildUnifiedLineParts(m.diffResult.Lines[i])
 		available := contentWidth - lipgloss.Width(prefix)
 		if available < 10 {
 			available = 10
 		}
 
-		wrapped := []string{content}
-		if m.wrapLines {
-			wrapped = wrapText(content, available)
-		}
-
-		for _, part := range wrapped {
-			trimmed := truncateWidth(part, available)
-			lines = append(lines, prefix+style.Render(trimmed))
+		segments := m.renderHighlightedSegments(content, highlights, style, m.highlightStyleForLine(m.diffResult.Lines[i]), available)
+		for _, segment := range segments {
+			lines = append(lines, prefix+segment)
 		}
 	}
 
 	return lines
+}
+
+func (m Model) highlightStyleForLine(line diff.DiffLine) lipgloss.Style {
+	switch line.Type {
+	case diff.Added:
+		return m.styles.inlineAdd
+	case diff.Removed:
+		return m.styles.inlineDel
+	default:
+		return m.styles.unchanged
+	}
 }
 
 func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
@@ -403,7 +573,7 @@ func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
 	}
 
 	for i := start; i < end; i++ {
-		line := m.diffResult.Lines[i]
+		line := diffLines[i]
 		leftContent, rightContent := m.renderSideBySideLine(line, columnWidth)
 		combinedLine := leftContent + " │ " + rightContent
 		if m.showBlame && m.gitCtx.Enabled {
@@ -413,6 +583,9 @@ func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
 		}
 
 		lines = append(lines, truncateWidth(combinedLine, contentWidth))
+		for s := 0; s < m.config.Spacing.LineSpacing; s++ {
+			lines = append(lines, "")
+		}
 	}
 
 	return lines
@@ -437,7 +610,8 @@ func (m Model) renderMinimap() string {
 		width = 6
 	}
 
-	total := len(m.diffResult.Lines)
+	diffLines := m.currentLines()
+	total := len(diffLines)
 	if total == 0 {
 		return ""
 	}
@@ -449,7 +623,7 @@ func (m Model) renderMinimap() string {
 	}
 
 	buckets := make([]bucket, height)
-	for idx, line := range m.diffResult.Lines {
+	for idx, line := range diffLines {
 		row := int(float64(idx) / float64(max(total, 1)) * float64(height))
 		if row >= height {
 			row = height - 1
@@ -494,22 +668,11 @@ func (m Model) renderMinimap() string {
 	return strings.Join(rows, "\n")
 }
 
-func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style, string) {
+func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style, string, []diff.Highlight) {
 	var parts []string
 
 	if m.config.ShowLineNo {
-		lineNo1 := " "
-		lineNo2 := " "
-		if line.LineNo1 > 0 {
-			lineNo1 = fmt.Sprintf("%5d", line.LineNo1)
-		} else {
-			lineNo1 = "     "
-		}
-		if line.LineNo2 > 0 {
-			lineNo2 = fmt.Sprintf("%5d", line.LineNo2)
-		} else {
-			lineNo2 = "     "
-		}
+		lineNo1, lineNo2 := m.lineNumberStrings(line)
 		parts = append(parts, m.styles.lineNumber.Render(lineNo1))
 		parts = append(parts, m.styles.lineNumber.Render(lineNo2))
 		parts = append(parts, " ")
@@ -548,7 +711,30 @@ func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style
 	}
 
 	content := symbol + " " + line.Content
-	return strings.Join(parts, ""), style, content
+	displayHighlights := offsetHighlights(line.Highlights, runeLen(symbol+" "))
+	return strings.Join(parts, ""), style, content, displayHighlights
+}
+
+func (m Model) renderHighlightedSegments(content string, highlights []diff.Highlight, baseStyle, highlightStyle lipgloss.Style, width int) []string {
+	wrapped := []string{content}
+	if m.wrapLines {
+		wrapped = wrapText(content, width)
+	}
+
+	var segments []string
+	offset := 0
+	for _, part := range wrapped {
+		trimmed := truncateWidth(part, width)
+		visibleLen := runeLen(trimmed)
+		if visibleLen < width {
+			trimmed = padRight(trimmed, width)
+		}
+		local := sliceHighlights(highlights, offset, offset+visibleLen)
+		segments = append(segments, applyHighlights(trimmed, local, baseStyle, highlightStyle))
+		offset += runeLen(part)
+	}
+
+	return segments
 }
 
 func wrapText(text string, width int) []string {
@@ -581,6 +767,18 @@ func wrapText(text string, width int) []string {
 	return lines
 }
 
+func runeLen(text string) int {
+	return len([]rune(text))
+}
+
+func padRight(text string, width int) string {
+	padding := width - runeLen(text)
+	if padding <= 0 {
+		return text
+	}
+	return text + strings.Repeat(" ", padding)
+}
+
 func truncateWidth(text string, width int) string {
 	if width <= 0 {
 		return ""
@@ -604,6 +802,69 @@ func truncateWidth(text string, width int) string {
 	return builder.String() + "..."
 }
 
+func applyHighlights(text string, highlights []diff.Highlight, baseStyle, highlightStyle lipgloss.Style) string {
+	if len(highlights) == 0 {
+		return baseStyle.Render(text)
+	}
+
+	type segment struct {
+		start int
+		end   int
+		style lipgloss.Style
+	}
+
+	runes := []rune(text)
+	var segments []segment
+	cursor := 0
+	for _, h := range highlights {
+		if h.Start > cursor {
+			segments = append(segments, segment{start: cursor, end: h.Start, style: baseStyle})
+		}
+		segments = append(segments, segment{start: h.Start, end: h.End, style: highlightStyle})
+		cursor = h.End
+	}
+
+	total := len(runes)
+	if cursor < total {
+		segments = append(segments, segment{start: cursor, end: total, style: baseStyle})
+	}
+
+	var builder strings.Builder
+	for _, seg := range segments {
+		if seg.end <= seg.start || seg.start >= len(runes) {
+			continue
+		}
+		if seg.end > len(runes) {
+			seg.end = len(runes)
+		}
+		builder.WriteString(seg.style.Render(string(runes[seg.start:seg.end])))
+	}
+
+	return builder.String()
+}
+
+func sliceHighlights(highlights []diff.Highlight, start, end int) []diff.Highlight {
+	var sliced []diff.Highlight
+	for _, h := range highlights {
+		if h.End <= start || h.Start >= end {
+			continue
+		}
+		sliced = append(sliced, diff.Highlight{Start: max(h.Start-start, 0), End: min(h.End, end) - start})
+	}
+	return sliced
+}
+
+func offsetHighlights(highlights []diff.Highlight, delta int) []diff.Highlight {
+	if delta == 0 {
+		return highlights
+	}
+	adjusted := make([]diff.Highlight, len(highlights))
+	for i, h := range highlights {
+		adjusted[i] = diff.Highlight{Start: h.Start + delta, End: h.End + delta}
+	}
+	return adjusted
+}
+
 func (m *Model) adjustMinimapWidth(delta int) {
 	m.minimapWidth += delta
 	if m.minimapWidth < 6 {
@@ -619,7 +880,7 @@ func (m *Model) adjustMinimapWidth(delta int) {
 }
 
 func (m *Model) lineForMinimapRow(row int) int {
-	total := len(m.diffResult.Lines)
+	total := len(m.currentLines())
 	if total == 0 {
 		return 0
 	}
@@ -716,14 +977,7 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 
 	// Line numbers
 	if m.config.ShowLineNo {
-		lineNo1 := "     "
-		lineNo2 := "     "
-		if line.LineNo1 > 0 {
-			lineNo1 = fmt.Sprintf("%5d", line.LineNo1)
-		}
-		if line.LineNo2 > 0 {
-			lineNo2 = fmt.Sprintf("%5d", line.LineNo2)
-		}
+		lineNo1, lineNo2 := m.lineNumberStrings(line)
 		leftParts = append(leftParts, m.styles.lineNumber.Render(lineNo1)+" ")
 		rightParts = append(rightParts, m.styles.lineNumber.Render(lineNo2)+" ")
 	}
@@ -731,23 +985,28 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 	// Content
 	leftContent := ""
 	rightContent := ""
+	var leftHighlights, rightHighlights []diff.Highlight
 
 	switch line.Type {
 	case diff.Removed:
 		leftContent = "- " + line.Content
 		rightContent = ""
+		leftHighlights = offsetHighlights(line.Highlights, runeLen("- "))
 	case diff.Added:
 		leftContent = ""
 		rightContent = "+ " + line.Content
+		rightHighlights = offsetHighlights(line.Highlights, runeLen("+ "))
 	case diff.Equal:
 		leftContent = "  " + line.Content
 		rightContent = "  " + line.Content
+		leftHighlights = offsetHighlights(line.Highlights, runeLen("  "))
+		rightHighlights = leftHighlights
 	}
 
 	// Calculate content width based on whether line numbers are shown
 	contentWidth := columnWidth
 	if m.config.ShowLineNo {
-		contentWidth = columnWidth - 8 // Account for line numbers (5 digits + 1 space + padding)
+		contentWidth = columnWidth - (m.lineNumberGutterWidth() + 1)
 	}
 
 	// Ensure minimum width
@@ -755,35 +1014,25 @@ func (m Model) renderSideBySideLine(line diff.DiffLine, columnWidth int) (string
 		contentWidth = 10
 	}
 
-	// Safely truncate content to fit column width
-	if len(leftContent) > contentWidth && contentWidth > 3 {
-		leftContent = leftContent[:contentWidth-3] + "..."
-	} else if len(leftContent) > contentWidth {
-		if contentWidth > 0 {
-			leftContent = leftContent[:contentWidth]
-		} else {
-			leftContent = ""
-		}
-	}
+	leftSegments := m.renderInlineColumn(leftContent, leftHighlights, leftStyle, m.highlightStyleForLine(line), contentWidth)
+	rightSegments := m.renderInlineColumn(rightContent, rightHighlights, rightStyle, m.highlightStyleForLine(line), contentWidth)
 
-	if len(rightContent) > contentWidth && contentWidth > 3 {
-		rightContent = rightContent[:contentWidth-3] + "..."
-	} else if len(rightContent) > contentWidth {
-		if contentWidth > 0 {
-			rightContent = rightContent[:contentWidth]
-		} else {
-			rightContent = ""
-		}
-	}
-
-	// Pad to column width
-	leftContent = fmt.Sprintf("%-*s", contentWidth, leftContent)
-	rightContent = fmt.Sprintf("%-*s", contentWidth, rightContent)
-
-	leftParts = append(leftParts, leftStyle.Render(leftContent))
-	rightParts = append(rightParts, rightStyle.Render(rightContent))
+	leftParts = append(leftParts, leftSegments)
+	rightParts = append(rightParts, rightSegments)
 
 	return strings.Join(leftParts, ""), strings.Join(rightParts, "")
+}
+
+func (m Model) renderInlineColumn(content string, highlights []diff.Highlight, baseStyle, highlightStyle lipgloss.Style, width int) string {
+	if width < 1 {
+		return ""
+	}
+
+	truncated := truncateWidth(content, width)
+	padded := padRight(truncated, width)
+	localized := sliceHighlights(highlights, 0, runeLen(padded))
+
+	return applyHighlights(padded, localized, baseStyle, highlightStyle)
 }
 
 // renderLine renders a single diff line in unified mode
@@ -792,18 +1041,7 @@ func (m Model) renderLine(line diff.DiffLine) string {
 
 	// Line numbers
 	if m.config.ShowLineNo {
-		lineNo1 := " "
-		lineNo2 := " "
-		if line.LineNo1 > 0 {
-			lineNo1 = fmt.Sprintf("%5d", line.LineNo1)
-		} else {
-			lineNo1 = "     "
-		}
-		if line.LineNo2 > 0 {
-			lineNo2 = fmt.Sprintf("%5d", line.LineNo2)
-		} else {
-			lineNo2 = "     "
-		}
+		lineNo1, lineNo2 := m.lineNumberStrings(line)
 		parts = append(parts, m.styles.lineNumber.Render(lineNo1))
 		parts = append(parts, m.styles.lineNumber.Render(lineNo2))
 		parts = append(parts, " ")
@@ -858,7 +1096,8 @@ func (m Model) renderLine(line diff.DiffLine) string {
 
 // renderStatusBar renders the status bar
 func (m Model) renderStatusBar() string {
-	added, removed, unchanged := m.diffResult.GetStats()
+	added, removed, unchanged := m.currentStats()
+	totalLines := len(m.currentLines())
 
 	// View mode indicator
 	viewMode := "unified"
@@ -877,16 +1116,26 @@ func (m Model) renderStatusBar() string {
 		wrapMode = "on"
 	}
 
+	lineNumbers := "off"
+	if m.config.ShowLineNo {
+		lineNumbers = "on"
+	}
+
+	themeLabel := string(m.config.ThemePreset)
+	if m.config.HighContrast {
+		themeLabel += "+hc"
+	}
+
 	gitInfo := ""
 	if m.gitCtx.Enabled {
 		gitInfo = fmt.Sprintf(" | git: %s→%s", m.gitCtx.Ref1, m.gitCtx.Ref2)
 	}
 
 	status := fmt.Sprintf(
-		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Wrap: %s | Color: %s%s | v:view c:color w:wrap <:map- >:map+ n/N:changes s:stats ?:help q:quit",
+		"Lines: +%d -%d =%d | Pos: %d/%d | View: %s | Wrap: %s | Color: %s | Theme: %s | Ln: %s | pad:%d space:%d%s | %s settings",
 		added, removed, unchanged,
 		m.viewport.offset+1, len(m.diffResult.Lines),
-		viewMode, wrapMode, syntaxMode, gitInfo,
+		viewMode, wrapMode, syntaxMode, themeLabel, lineNumbers, m.config.Spacing.LinePadding, m.config.Spacing.LineSpacing, gitInfo, m.keyDisplay(actionToggleSettings),
 	)
 
 	if m.statusMessage != "" {
@@ -894,6 +1143,37 @@ func (m Model) renderStatusBar() string {
 	}
 
 	return m.styles.statusBar.Width(m.width).Render(status)
+}
+
+func (m Model) currentStats() (added, removed, unchanged int) {
+	for _, line := range m.currentLines() {
+		switch line.Type {
+		case diff.Added:
+			added++
+		case diff.Removed:
+			removed++
+		case diff.Equal:
+			unchanged++
+		}
+	}
+
+	return added, removed, unchanged
+}
+
+func (m Model) currentLines() []diff.DiffLine {
+	if len(m.renderedLines) > 0 {
+		return m.renderedLines
+	}
+
+	if m.loading && m.diffResult != nil {
+		return m.renderedLines
+	}
+
+	if m.diffResult != nil {
+		return m.diffResult.Lines
+	}
+
+	return nil
 }
 
 func (m Model) renderActivePanel() string {
@@ -915,7 +1195,7 @@ func (m Model) renderActivePanel() string {
 
 // renderHelpPanel renders the help panel below the main view
 func (m Model) renderHelpPanel() string {
-	helpText := []string{
+	helps := []string{
 		"",
 		"Keyboard Shortcuts:",
 		"  j, ↓      Scroll down     │  g         Go to top        │  v    Toggle side-by-side",
@@ -936,7 +1216,7 @@ func (m Model) renderHelpPanel() string {
 		Padding(0, 1).
 		Width(m.width - 2)
 
-	return helpStyle.Render(strings.Join(helpText, "\n"))
+	return helpStyle.Render(strings.Join(helps, "\n"))
 }
 
 func (m Model) renderCommandPalette() string {
@@ -971,6 +1251,180 @@ func (m Model) renderCommandPalette() string {
 		Width(m.width - 2)
 
 	return style.Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) renderSettingsModal() string {
+	if len(m.settingsEntries) == 0 {
+		return ""
+	}
+
+	currentSection := ""
+	var lines []string
+	lines = append(lines, " Settings")
+
+	for i, entry := range m.settingsEntries {
+		if entry.section != currentSection {
+			lines = append(lines, "")
+			lines = append(lines, m.styles.section.Render(entry.section))
+			currentSection = entry.section
+		}
+
+		value := m.settingDescription(entry)
+		label := fmt.Sprintf("%s  %s", entry.label, value)
+		if i == m.settingsIndex {
+			label = m.styles.selection.Render("> " + label)
+		} else {
+			label = "  " + label
+		}
+		lines = append(lines, label)
+	}
+
+	style := m.styles.help.Copy().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.config.Theme.BorderFg).
+		Padding(0, 1).
+		Width(m.width - 2)
+
+	return style.Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) toggleSettings() {
+	m.showSettings = !m.showSettings
+	if m.showSettings {
+		m.showCommand = false
+		m.goToLineActive = false
+		m.refreshSettingsEntries()
+	} else {
+		m.settingsIndex = 0
+	}
+	m.updateViewportHeight()
+}
+
+func (m *Model) refreshSettingsEntries() {
+	m.settingsEntries = []settingsEntry{
+		{section: "Theme", label: "Preset", action: settingsActionTheme},
+		{section: "Theme", label: "High contrast", action: settingsActionContrast},
+		{section: "Layout", label: "Line numbers", action: settingsActionLineNumbers},
+		{section: "Layout", label: "Line number width", action: settingsActionLineNumberWidth},
+		{section: "Layout", label: "Line padding", action: settingsActionLinePadding},
+		{section: "Layout", label: "Line spacing", action: settingsActionLineSpacing},
+		{section: "Input", label: "Keybindings", action: settingsActionKeybindings},
+	}
+
+	if m.settingsIndex >= len(m.settingsEntries) {
+		m.settingsIndex = max(0, len(m.settingsEntries)-1)
+	}
+}
+
+func (m Model) settingDescription(entry settingsEntry) string {
+	switch entry.action {
+	case settingsActionTheme:
+		return string(m.config.ThemePreset)
+	case settingsActionContrast:
+		if m.config.HighContrast {
+			return "On"
+		}
+		return "Off"
+	case settingsActionLineNumbers:
+		if m.config.ShowLineNo {
+			return "Shown"
+		}
+		return "Hidden"
+	case settingsActionLineNumberWidth:
+		return fmt.Sprintf("%d cols", m.config.Spacing.LineNumberWidth)
+	case settingsActionLinePadding:
+		return fmt.Sprintf("%d spaces", m.config.Spacing.LinePadding)
+	case settingsActionLineSpacing:
+		return fmt.Sprintf("%d extra", m.config.Spacing.LineSpacing)
+	case settingsActionKeybindings:
+		if len(m.overrideKeys) == 0 {
+			return "Defaults"
+		}
+		if m.useOverrides {
+			return "Overrides"
+		}
+		return "Defaults"
+	default:
+		return ""
+	}
+}
+
+func (m *Model) handleSettingsInput(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "esc":
+		m.showSettings = false
+		m.updateViewportHeight()
+		return
+	case "up", "k":
+		m.settingsIndex--
+		if m.settingsIndex < 0 {
+			m.settingsIndex = 0
+		}
+	case "down", "j":
+		m.settingsIndex++
+		if m.settingsIndex >= len(m.settingsEntries) {
+			m.settingsIndex = len(m.settingsEntries) - 1
+		}
+	case "left", "h":
+		m.applySettingsAction(-1)
+	case "right", "l", "enter", " ":
+		m.applySettingsAction(1)
+	}
+}
+
+func (m *Model) applySettingsAction(direction int) {
+	if len(m.settingsEntries) == 0 {
+		return
+	}
+
+	entry := m.settingsEntries[m.settingsIndex]
+	switch entry.action {
+	case settingsActionTheme:
+		presets := []config.ThemePreset{config.PresetDefault, config.PresetSolarize, config.PresetDracula}
+		idx := 0
+		for i, p := range presets {
+			if p == m.config.ThemePreset {
+				idx = i
+				break
+			}
+		}
+		idx = (idx + direction + len(presets)) % len(presets)
+		m.config.ThemePreset = presets[idx]
+		m.applyTheme()
+	case settingsActionContrast:
+		m.config.HighContrast = !m.config.HighContrast
+		m.applyTheme()
+	case settingsActionLineNumbers:
+		m.config.ShowLineNo = !m.config.ShowLineNo
+	case settingsActionLineNumberWidth:
+		options := []int{4, 6, 8}
+		m.config.Spacing.LineNumberWidth = cycleInt(options, m.config.Spacing.LineNumberWidth, direction)
+		m.refreshStyles()
+	case settingsActionLinePadding:
+		options := []int{0, 1, 2}
+		m.config.Spacing.LinePadding = cycleInt(options, m.config.Spacing.LinePadding, direction)
+		m.refreshStyles()
+	case settingsActionLineSpacing:
+		options := []int{0, 1, 2}
+		m.config.Spacing.LineSpacing = cycleInt(options, m.config.Spacing.LineSpacing, direction)
+	case settingsActionKeybindings:
+		if len(m.overrideKeys) == 0 {
+			m.keybindings = config.DefaultKeybindings()
+			m.useOverrides = false
+			m.config.Keybindings = config.Keybindings{}
+			break
+		}
+		m.useOverrides = !m.useOverrides
+		if m.useOverrides {
+			m.keybindings = config.MergeKeybindings(m.overrideKeys)
+			m.config.Keybindings = copyKeybindings(m.overrideKeys)
+		} else {
+			m.keybindings = config.DefaultKeybindings()
+			m.config.Keybindings = config.Keybindings{}
+		}
+	}
+
+	m.refreshSettingsEntries()
 }
 
 func (m Model) renderGoToLineDialog() string {
@@ -1146,6 +1600,8 @@ func (m *Model) executePaletteSelection() {
 		}
 	case paletteActionToggleWrap:
 		m.wrapLines = !m.wrapLines
+	case paletteActionOpenSettings:
+		m.toggleSettings()
 	case paletteActionGoTop:
 		m.scrollToTop()
 	case paletteActionGoBottom:
@@ -1176,6 +1632,7 @@ func (m *Model) refreshPaletteEntries() {
 		paletteEntry{section: "Commands", label: "Toggle side-by-side", description: "v", action: paletteActionToggleSideBySide},
 		paletteEntry{section: "Commands", label: "Toggle syntax colors", description: "c", action: paletteActionToggleSyntax},
 		paletteEntry{section: "Commands", label: "Toggle wrapping", description: "w", action: paletteActionToggleWrap},
+		paletteEntry{section: "Commands", label: "Settings", description: ",", action: paletteActionOpenSettings},
 		paletteEntry{section: "Commands", label: "Toggle blame", description: "b", action: paletteActionToggleBlame},
 		paletteEntry{section: "Commands", label: "Go to top", description: "g", action: paletteActionGoTop},
 		paletteEntry{section: "Commands", label: "Go to bottom", description: "G", action: paletteActionGoBottom},
@@ -1186,10 +1643,11 @@ func (m *Model) refreshPaletteEntries() {
 	)
 
 	for _, offset := range m.changeOffsets() {
-		if offset < 0 || offset >= len(m.diffResult.Lines) {
+		lines := m.currentLines()
+		if offset < 0 || offset >= len(lines) {
 			continue
 		}
-		line := m.diffResult.Lines[offset]
+		line := lines[offset]
 		displayNo := displayLineNumber(line)
 		snippet := truncate(strings.TrimSpace(line.Content), 60)
 		entries = append(entries, paletteEntry{
@@ -1333,7 +1791,7 @@ func (m *Model) changeOffsets() []int {
 	var offsets []int
 	prevChange := false
 
-	for idx, line := range m.diffResult.Lines {
+	for idx, line := range m.currentLines() {
 		isChange := line.Type != diff.Equal
 		if isChange && !prevChange {
 			offsets = append(offsets, idx)
@@ -1350,7 +1808,7 @@ func (m *Model) lineAnchors() []int {
 
 	total := len(m.diffResult.File2Lines)
 	if total == 0 {
-		total = len(m.diffResult.Lines)
+		total = len(m.currentLines())
 	}
 	if total == 0 {
 		return nil
@@ -1384,6 +1842,7 @@ func (m *Model) openGoToLineDialog() {
 	m.goToLineActive = true
 	m.goToLineValue = ""
 	m.goToLineError = ""
+	m.showSettings = false
 	m.showCommand = false
 	m.updateViewportHeight()
 }
@@ -1436,24 +1895,24 @@ func (m *Model) offsetForLine(lineNumber int) int {
 		return 0
 	}
 
-	for idx, line := range m.diffResult.Lines {
+	for idx, line := range m.currentLines() {
 		displayNo := displayLineNumber(line)
 		if displayNo >= lineNumber && displayNo > 0 {
 			return idx
 		}
 	}
 
-	if len(m.diffResult.Lines) == 0 {
+	if len(m.currentLines()) == 0 {
 		return 0
 	}
-	return len(m.diffResult.Lines) - 1
+	return len(m.currentLines()) - 1
 }
 
 func (m *Model) jumpToOffset(offset int) {
 	if m.diffResult == nil {
 		return
 	}
-	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	maxOffset := max(0, len(m.currentLines())-m.viewport.height)
 	if offset < 0 {
 		offset = 0
 	}
@@ -1465,7 +1924,7 @@ func (m *Model) jumpToOffset(offset int) {
 
 // Scroll functions
 func (m *Model) scrollDown() {
-	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	maxOffset := max(0, len(m.currentLines())-m.viewport.height)
 	if m.viewport.offset < maxOffset {
 		m.viewport.offset++
 	}
@@ -1483,7 +1942,7 @@ func (m *Model) scrollPageDown() {
 		halfPage = 1
 	}
 	m.viewport.offset += halfPage
-	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	maxOffset := max(0, len(m.currentLines())-m.viewport.height)
 	if m.viewport.offset > maxOffset {
 		m.viewport.offset = maxOffset
 	}
@@ -1505,7 +1964,7 @@ func (m *Model) scrollToTop() {
 }
 
 func (m *Model) scrollToBottom() {
-	m.viewport.offset = max(0, len(m.diffResult.Lines)-m.viewport.height)
+	m.viewport.offset = max(0, len(m.currentLines())-m.viewport.height)
 }
 
 func (m *Model) togglePanel(target panelType) {
@@ -1639,6 +2098,10 @@ func (m *Model) updateViewportHeight() {
 		baseHeight -= min(m.commandHeight, len(m.paletteEntries)+4)
 	}
 
+	if m.showSettings {
+		baseHeight -= min(8, len(m.settingsEntries)+4)
+	}
+
 	if m.goToLineActive {
 		baseHeight -= 3
 	}
@@ -1649,6 +2112,73 @@ func (m *Model) updateViewportHeight() {
 	}
 
 	m.viewport.height = baseHeight
+}
+
+func (m Model) matchesKey(action string, msg tea.KeyMsg) bool {
+	keys := m.keybindings[action]
+	if len(keys) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		if msg.String() == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Model) keyDisplay(action string) string {
+	keys := m.keybindings[action]
+	if len(keys) == 0 {
+		return ""
+	}
+	return strings.Join(keys, "/")
+}
+
+func (m Model) lineNumberGutterWidth() int {
+	width := m.config.Spacing.LineNumberWidth
+	if width < 4 {
+		width = 4
+	}
+	return width
+}
+
+func (m Model) lineNumberStrings(line diff.DiffLine) (string, string) {
+	width := m.lineNumberGutterWidth() - 1
+	if width < 2 {
+		width = 2
+	}
+	blank := strings.Repeat(" ", width)
+	format := fmt.Sprintf("%%%dd", width)
+
+	lineNo1 := blank
+	lineNo2 := blank
+	if line.LineNo1 > 0 {
+		lineNo1 = fmt.Sprintf(format, line.LineNo1)
+	}
+	if line.LineNo2 > 0 {
+		lineNo2 = fmt.Sprintf(format, line.LineNo2)
+	}
+	return lineNo1, lineNo2
+}
+
+func (m *Model) applyTheme() {
+	m.config.Theme = config.ThemeForPreset(m.config.ThemePreset, m.config.HighContrast)
+	m.refreshStyles()
+}
+
+func (m *Model) refreshStyles() {
+	m.styles = createStyles(m.config)
+}
+
+func copyKeybindings(src config.Keybindings) config.Keybindings {
+	dup := config.Keybindings{}
+	for action, keys := range src {
+		copied := make([]string, len(keys))
+		copy(copied, keys)
+		dup[action] = copied
+	}
+	return dup
 }
 
 // Utility functions
@@ -1664,6 +2194,21 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func cycleInt(options []int, current int, direction int) int {
+	if len(options) == 0 {
+		return current
+	}
+	idx := 0
+	for i, v := range options {
+		if v == current {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + direction + len(options)) % len(options)
+	return options[idx]
 }
 
 func truncate(s string, maxLen int) string {
