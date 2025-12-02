@@ -2,6 +2,7 @@ package diff
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 
 	"github.com/pmezard/go-difflib/difflib"
@@ -65,9 +66,12 @@ func (e *Engine) DiffLines(lines1, lines2 []string, file1Name, file2Name string)
 		File2Lines: lines2,
 	}
 
-	// Get the opcodes for a more structured diff
-	matcher := difflib.NewMatcher(lines1, lines2)
-	opcodes := matcher.GetOpCodes()
+	opcodes, err := generateOpCodes(lines1, lines2)
+	if err != nil {
+		// Fall back to a simpler diff strategy when the advanced matcher fails
+		result.Lines = simpleDiff(lines1, lines2)
+		return result
+	}
 
 	var diffLines []DiffLine
 	lineNo1, lineNo2 := 1, 1
@@ -136,6 +140,69 @@ func (e *Engine) DiffLines(lines1, lines2 []string, file1Name, file2Name string)
 
 	result.Lines = diffLines
 	return result
+}
+
+func generateOpCodes(lines1, lines2 []string) (opcodes []difflib.OpCode, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("advanced diff failed: %v", r)
+		}
+	}()
+
+	matcher := difflib.NewMatcher(lines1, lines2)
+	return matcher.GetOpCodes(), nil
+}
+
+func simpleDiff(lines1, lines2 []string) []DiffLine {
+	var diffLines []DiffLine
+	lineNo1, lineNo2 := 1, 1
+	maxLen := max(len(lines1), len(lines2))
+
+	for i := 0; i < maxLen; i++ {
+		has1 := i < len(lines1)
+		has2 := i < len(lines2)
+
+		switch {
+		case has1 && has2 && lines1[i] == lines2[i]:
+			diffLines = append(diffLines, DiffLine{
+				Type:    Equal,
+				Content: lines1[i],
+				LineNo1: lineNo1,
+				LineNo2: lineNo2,
+			})
+			lineNo1++
+			lineNo2++
+		case has1 && has2:
+			diffLines = append(diffLines, DiffLine{
+				Type:    Removed,
+				Content: lines1[i],
+				LineNo1: lineNo1,
+			})
+			diffLines = append(diffLines, DiffLine{
+				Type:    Added,
+				Content: lines2[i],
+				LineNo2: lineNo2,
+			})
+			lineNo1++
+			lineNo2++
+		case has1:
+			diffLines = append(diffLines, DiffLine{
+				Type:    Removed,
+				Content: lines1[i],
+				LineNo1: lineNo1,
+			})
+			lineNo1++
+		case has2:
+			diffLines = append(diffLines, DiffLine{
+				Type:    Added,
+				Content: lines2[i],
+				LineNo2: lineNo2,
+			})
+			lineNo2++
+		}
+	}
+
+	return diffLines
 }
 
 // readFileLines reads a file and returns its lines
