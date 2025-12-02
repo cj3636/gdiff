@@ -22,6 +22,7 @@ type Model struct {
 	overrideKeys     config.Keybindings
 	useOverrides     bool
 	diffEngine       *diff.Engine
+	renderedLines    []diff.DiffLine
 	styles           *Styles
 	viewport         Viewport
 	width            int
@@ -51,6 +52,10 @@ type Model struct {
 	minimapWidth     int
 	minimapStartCol  int
 	minimapHeight    int
+	chunkSize        int
+	loading          bool
+	loadProgress     float64
+	statusMessage    string
 }
 
 type settingsEntry struct {
@@ -126,6 +131,14 @@ const (
 	paletteActionJumpOffset
 )
 
+type diffChunkMsg struct {
+	lines     []diff.DiffLine
+	nextStart int
+	total     int
+	done      bool
+	progress  float64
+}
+
 type panelType int
 
 const (
@@ -160,6 +173,31 @@ type Styles struct {
 	minimapDel lipgloss.Style
 }
 
+func loadDiffChunkCmd(lines []diff.DiffLine, start, size int) tea.Cmd {
+	return func() tea.Msg {
+		if start >= len(lines) {
+			return diffChunkMsg{done: true, progress: 1}
+		}
+
+		end := start + size
+		if end > len(lines) {
+			end = len(lines)
+		}
+
+		chunk := make([]diff.DiffLine, end-start)
+		copy(chunk, lines[start:end])
+
+		progress := float64(end) / float64(max(len(lines), 1))
+		return diffChunkMsg{
+			lines:     chunk,
+			nextStart: end,
+			total:     len(lines),
+			done:      end >= len(lines),
+			progress:  progress,
+		}
+	}
+}
+
 // NewModel creates a new TUI model
 func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engine, gitCtx GitContext) Model {
 	if cfg.Keybindings == nil {
@@ -191,6 +229,7 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 		gitCtx:           gitCtx,
 		wrapLines:        false,
 		minimapWidth:     14,
+		chunkSize:        chunkSize,
 	}
 
 	if gitCtx.Enabled {
@@ -199,6 +238,17 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 				model.branchIndex = i
 				break
 			}
+		}
+	}
+
+	if diffResult != nil {
+		if len(diffResult.Lines) == 0 {
+			model.statusMessage = "Diff loaded"
+			model.loadProgress = 1
+			model.renderedLines = diffResult.Lines
+		} else {
+			model.loading = true
+			model.statusMessage = "Loading diff..."
 		}
 	}
 
@@ -264,12 +314,31 @@ func createStyles(cfg *config.Config) *Styles {
 
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
+	if m.diffResult != nil && len(m.diffResult.Lines) > 0 {
+		return loadDiffChunkCmd(m.diffResult.Lines, 0, m.chunkSize)
+	}
+
 	return nil
 }
 
 // Update handles messages and updates the model
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case diffChunkMsg:
+		m.renderedLines = append(m.renderedLines, msg.lines...)
+		m.loadProgress = msg.progress
+		m.loading = !msg.done
+
+		if msg.done {
+			m.statusMessage = "Diff loaded"
+			if len(m.renderedLines) == 0 && m.diffResult != nil {
+				m.renderedLines = m.diffResult.Lines
+			}
+		} else {
+			m.statusMessage = fmt.Sprintf("Loading diff... %d%%", int(msg.progress*100))
+			return m, loadDiffChunkCmd(m.diffResult.Lines, msg.nextStart, m.chunkSize)
+		}
+
 	case tea.KeyMsg:
 		if m.goToLineActive {
 			m.handleGoToLineInput(msg)
@@ -412,26 +481,31 @@ func (m Model) renderTitle() string {
 
 // renderDiff renders the diff content
 func (m Model) renderDiff() string {
+	diffLines := m.currentLines()
+
 	// Calculate visible range
 	start := m.viewport.offset
-	end := min(start+m.viewport.height, len(m.diffResult.Lines))
+	end := min(start+m.viewport.height, len(diffLines))
 
-	if start >= len(m.diffResult.Lines) {
-		start = max(0, len(m.diffResult.Lines)-m.viewport.height)
+	if start >= len(diffLines) {
+		start = max(0, len(diffLines)-m.viewport.height)
 		m.viewport.offset = start
-		end = len(m.diffResult.Lines)
+		end = len(diffLines)
 	}
 
-	if start >= end || len(m.diffResult.Lines) == 0 {
+	if start >= end || len(diffLines) == 0 {
+		if m.loading && m.statusMessage != "" {
+			return m.styles.unchanged.Render(m.statusMessage)
+		}
 		return m.styles.unchanged.Render("No differences found.")
 	}
 
 	contentWidth := m.availableContentWidth()
 	var lines []string
 	if m.sideBySideMode {
-		lines = m.renderSideBySideLines(start, end, contentWidth)
+		lines = m.renderSideBySideLines(start, end, contentWidth, diffLines)
 	} else {
-		lines = m.renderUnifiedLines(start, end, contentWidth)
+		lines = m.renderUnifiedLines(start, end, contentWidth, diffLines)
 	}
 
 	lines = m.padLines(lines, m.viewport.height)
@@ -450,11 +524,11 @@ func (m *Model) availableContentWidth() int {
 	return width
 }
 
-func (m Model) renderUnifiedLines(start, end, contentWidth int) []string {
+func (m Model) renderUnifiedLines(start, end, contentWidth int, diffLines []diff.DiffLine) []string {
 	var lines []string
 
 	for i := start; i < end; i++ {
-		prefix, style, content := m.buildUnifiedLineParts(m.diffResult.Lines[i])
+		prefix, style, content := m.buildUnifiedLineParts(diffLines[i])
 		available := contentWidth - lipgloss.Width(prefix)
 		if available < 10 {
 			available = 10
@@ -477,7 +551,7 @@ func (m Model) renderUnifiedLines(start, end, contentWidth int) []string {
 	return lines
 }
 
-func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
+func (m Model) renderSideBySideLines(start, end, contentWidth int, diffLines []diff.DiffLine) []string {
 	var lines []string
 
 	columnWidth := (contentWidth - 3) / 2
@@ -486,7 +560,7 @@ func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
 	}
 
 	for i := start; i < end; i++ {
-		line := m.diffResult.Lines[i]
+		line := diffLines[i]
 		leftContent, rightContent := m.renderSideBySideLine(line, columnWidth)
 		combinedLine := leftContent + " │ " + rightContent
 		if m.showBlame && m.gitCtx.Enabled {
@@ -523,7 +597,8 @@ func (m Model) renderMinimap() string {
 		width = 6
 	}
 
-	total := len(m.diffResult.Lines)
+	diffLines := m.currentLines()
+	total := len(diffLines)
 	if total == 0 {
 		return ""
 	}
@@ -535,7 +610,7 @@ func (m Model) renderMinimap() string {
 	}
 
 	buckets := make([]bucket, height)
-	for idx, line := range m.diffResult.Lines {
+	for idx, line := range diffLines {
 		row := int(float64(idx) / float64(max(total, 1)) * float64(height))
 		if row >= height {
 			row = height - 1
@@ -694,7 +769,7 @@ func (m *Model) adjustMinimapWidth(delta int) {
 }
 
 func (m *Model) lineForMinimapRow(row int) int {
-	total := len(m.diffResult.Lines)
+	total := len(m.currentLines())
 	if total == 0 {
 		return 0
 	}
@@ -915,7 +990,8 @@ func (m Model) renderLine(line diff.DiffLine) string {
 
 // renderStatusBar renders the status bar
 func (m Model) renderStatusBar() string {
-	added, removed, unchanged := m.diffResult.GetStats()
+	added, removed, unchanged := m.currentStats()
+	totalLines := len(m.currentLines())
 
 	// View mode indicator
 	viewMode := "unified"
@@ -956,7 +1032,46 @@ func (m Model) renderStatusBar() string {
 		viewMode, wrapMode, syntaxMode, themeLabel, lineNumbers, m.config.Spacing.LinePadding, m.config.Spacing.LineSpacing, gitInfo, m.keyDisplay(actionToggleSettings),
 	)
 
+	if m.loading {
+		status += fmt.Sprintf(" | Load: %d%%", int(m.loadProgress*100))
+	} else if m.statusMessage != "" {
+		status += " | " + m.statusMessage
+	}
+
+	status += " | v:view c:color w:wrap <:map- >:map+ n/N:changes s:stats ?:help q:quit"
+
 	return m.styles.statusBar.Width(m.width).Render(status)
+}
+
+func (m Model) currentStats() (added, removed, unchanged int) {
+	for _, line := range m.currentLines() {
+		switch line.Type {
+		case diff.Added:
+			added++
+		case diff.Removed:
+			removed++
+		case diff.Equal:
+			unchanged++
+		}
+	}
+
+	return added, removed, unchanged
+}
+
+func (m Model) currentLines() []diff.DiffLine {
+	if len(m.renderedLines) > 0 {
+		return m.renderedLines
+	}
+
+	if m.loading && m.diffResult != nil {
+		return m.renderedLines
+	}
+
+	if m.diffResult != nil {
+		return m.diffResult.Lines
+	}
+
+	return nil
 }
 
 func (m Model) renderActivePanel() string {
@@ -1419,10 +1534,11 @@ func (m *Model) refreshPaletteEntries() {
 	)
 
 	for _, offset := range m.changeOffsets() {
-		if offset < 0 || offset >= len(m.diffResult.Lines) {
+		lines := m.currentLines()
+		if offset < 0 || offset >= len(lines) {
 			continue
 		}
-		line := m.diffResult.Lines[offset]
+		line := lines[offset]
 		displayNo := displayLineNumber(line)
 		snippet := truncate(strings.TrimSpace(line.Content), 60)
 		entries = append(entries, paletteEntry{
@@ -1458,7 +1574,7 @@ func (m *Model) changeOffsets() []int {
 	var offsets []int
 	prevChange := false
 
-	for idx, line := range m.diffResult.Lines {
+	for idx, line := range m.currentLines() {
 		isChange := line.Type != diff.Equal
 		if isChange && !prevChange {
 			offsets = append(offsets, idx)
@@ -1475,7 +1591,7 @@ func (m *Model) lineAnchors() []int {
 
 	total := len(m.diffResult.File2Lines)
 	if total == 0 {
-		total = len(m.diffResult.Lines)
+		total = len(m.currentLines())
 	}
 	if total == 0 {
 		return nil
@@ -1562,24 +1678,24 @@ func (m *Model) offsetForLine(lineNumber int) int {
 		return 0
 	}
 
-	for idx, line := range m.diffResult.Lines {
+	for idx, line := range m.currentLines() {
 		displayNo := displayLineNumber(line)
 		if displayNo >= lineNumber && displayNo > 0 {
 			return idx
 		}
 	}
 
-	if len(m.diffResult.Lines) == 0 {
+	if len(m.currentLines()) == 0 {
 		return 0
 	}
-	return len(m.diffResult.Lines) - 1
+	return len(m.currentLines()) - 1
 }
 
 func (m *Model) jumpToOffset(offset int) {
 	if m.diffResult == nil {
 		return
 	}
-	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	maxOffset := max(0, len(m.currentLines())-m.viewport.height)
 	if offset < 0 {
 		offset = 0
 	}
@@ -1591,7 +1707,7 @@ func (m *Model) jumpToOffset(offset int) {
 
 // Scroll functions
 func (m *Model) scrollDown() {
-	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	maxOffset := max(0, len(m.currentLines())-m.viewport.height)
 	if m.viewport.offset < maxOffset {
 		m.viewport.offset++
 	}
@@ -1609,7 +1725,7 @@ func (m *Model) scrollPageDown() {
 		halfPage = 1
 	}
 	m.viewport.offset += halfPage
-	maxOffset := max(0, len(m.diffResult.Lines)-m.viewport.height)
+	maxOffset := max(0, len(m.currentLines())-m.viewport.height)
 	if m.viewport.offset > maxOffset {
 		m.viewport.offset = maxOffset
 	}
@@ -1631,7 +1747,7 @@ func (m *Model) scrollToTop() {
 }
 
 func (m *Model) scrollToBottom() {
-	m.viewport.offset = max(0, len(m.diffResult.Lines)-m.viewport.height)
+	m.viewport.offset = max(0, len(m.currentLines())-m.viewport.height)
 }
 
 func (m *Model) togglePanel(target panelType) {
