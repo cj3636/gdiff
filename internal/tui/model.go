@@ -41,7 +41,7 @@ type Model struct {
 	activePanel      panelType
 	gitCtx           GitContext
 	branchIndex      int
-	paletteEntries   []paletteEntry
+	paletteEntries   []PaletteEntry
 	paletteIndex     int
 	settingsEntries  []settingsEntry
 	settingsIndex    int
@@ -50,10 +50,10 @@ type Model struct {
 	goToLineValue    string
 	goToLineError    string
 	wrapLines        bool
-	minimapWidth     int
-	minimapStartCol  int
-	minimapHeight    int
 	statusMessage    string
+	loading          bool
+	loadProgress     float64
+	chunkSize        int
 }
 
 type settingsEntry struct {
@@ -89,8 +89,6 @@ const (
 	actionToggleWrap        = "toggle_wrap"
 	actionToggleBlame       = "toggle_blame"
 	actionToggleLineNumbers = "toggle_line_numbers"
-	actionMinimapNarrow     = "minimap_narrow"
-	actionMinimapWiden      = "minimap_widen"
 	actionNextChange        = "next_change"
 	actionPrevChange        = "prev_change"
 	actionScrollDown        = "scroll_down"
@@ -102,22 +100,21 @@ const (
 	actionGoLine            = "go_line"
 	actionPrevBranch        = "prev_branch"
 	actionNextBranch        = "next_branch"
+	actionCopyDiff          = "copy_diff"
+	actionSaveDiff          = "save_diff"
 )
 
-type paletteEntry struct {
+type PaletteEntry struct {
 	section      string
 	label        string
 	description  string
-	action       paletteAction
+	action       PaletteAction
 	offsetTarget int
 	format       export.Format
 }
 
-type paletteAction int
-
 const (
-	paletteActionNone paletteAction = iota
-	paletteActionToggleHelp
+	paletteActionToggleHelp PaletteAction = iota
 	paletteActionToggleStats
 	paletteActionToggleSideBySide
 	paletteActionToggleSyntax
@@ -130,6 +127,25 @@ const (
 	paletteActionJumpOffset
 	paletteActionCopyDiff
 	paletteActionSaveDiff
+)
+
+type PaletteAction int
+
+const (
+	PaletteActionNone PaletteAction = iota
+	PaletteActionToggleHelp
+	PaletteActionToggleStats
+	PaletteActionToggleSideBySide
+	PaletteActionToggleSyntax
+	PaletteActionToggleBlame
+	PaletteActionToggleWrap
+	PaletteActionOpenSettings
+	PaletteActionGoTop
+	PaletteActionGoBottom
+	PaletteActionGoToLine
+	PaletteActionJumpOffset
+	PaletteActionCopyDiff
+	PaletteActionSaveDiff
 )
 
 type diffChunkMsg struct {
@@ -165,15 +181,12 @@ type Styles struct {
 	lineNumber lipgloss.Style
 	inlineAdd  lipgloss.Style
 	inlineDel  lipgloss.Style
-	border     lipgloss.Style
 	title      lipgloss.Style
 	help       lipgloss.Style
 	statusBar  lipgloss.Style
 	blame      lipgloss.Style
 	selection  lipgloss.Style
 	section    lipgloss.Style
-	minimapAdd lipgloss.Style
-	minimapDel lipgloss.Style
 }
 
 func loadDiffChunkCmd(lines []diff.DiffLine, start, size int) tea.Cmd {
@@ -219,11 +232,13 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 		useOverrides:     len(overrides) > 0,
 		diffEngine:       engine,
 		styles:           styles,
+		width:            120,
+		height:           40,
 		viewport:         Viewport{offset: 0, height: 20},
 		showHelp:         false,
 		showStats:        false,
 		showCommand:      false,
-		sideBySideMode:   false,
+		sideBySideMode:   true,
 		syntaxHighlight:  true, // Default to enabled
 		showBlame:        gitCtx.ShowBlame,
 		helpPanelHeight:  12,
@@ -231,8 +246,9 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 		commandHeight:    16,
 		gitCtx:           gitCtx,
 		wrapLines:        false,
-		minimapWidth:     14,
-		chunkSize:        chunkSize,
+		chunkSize:        1000,
+		loading:          false,
+		loadProgress:     0.0,
 	}
 
 	if gitCtx.Enabled {
@@ -257,6 +273,7 @@ func NewModel(diffResult *diff.DiffResult, cfg *config.Config, engine *diff.Engi
 
 	model.refreshPaletteEntries()
 	model.refreshSettingsEntries()
+	model.updateViewportHeight()
 	return model
 }
 
@@ -290,37 +307,26 @@ func createStyles(cfg *config.Config) *Styles {
 			Foreground(theme.LineNumberFg).
 			Width(gutterWidth).
 			Align(lipgloss.Right),
-		border: lipgloss.NewStyle().
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(theme.BorderFg),
 		title: lipgloss.NewStyle().
 			Foreground(theme.TitleFg).
 			Background(theme.TitleBg).
-			Bold(true).
 			Padding(0, 1),
 		help: lipgloss.NewStyle().
-			Foreground(theme.HelpFg).
-			Italic(true),
+			Foreground(theme.HelpFg),
 		statusBar: lipgloss.NewStyle().
-			Foreground(theme.TitleFg).
-			Background(theme.TitleBg).
-			Padding(0, 1),
+			Background(lipgloss.Color("#333333")).
+			Foreground(lipgloss.Color("#FFFFFF")),
 		blame: lipgloss.NewStyle().
-			Foreground(theme.HelpFg).
-			Faint(true),
+			Foreground(lipgloss.Color("#999999")),
 		selection: lipgloss.NewStyle().
-			Foreground(theme.TitleBg).
-			Background(theme.TitleFg).
-			Bold(true),
+			Background(lipgloss.Color("#555555")),
 		section: lipgloss.NewStyle().
-			Foreground(theme.TitleFg).
+			Foreground(lipgloss.Color("#AAAAAA")).
 			Bold(true),
-		minimapAdd: lipgloss.NewStyle().Foreground(theme.AddedFg),
-		minimapDel: lipgloss.NewStyle().Foreground(theme.RemovedFg),
 	}
 }
 
-// Init initializes the model
+// Init initializes the TUI model
 func (m Model) Init() tea.Cmd {
 	if m.diffResult != nil && len(m.diffResult.Lines) > 0 {
 		return loadDiffChunkCmd(m.diffResult.Lines, 0, m.chunkSize)
@@ -346,6 +352,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = fmt.Sprintf("Loading diff... %d%%", int(msg.progress*100))
 			return m, loadDiffChunkCmd(m.diffResult.Lines, msg.nextStart, m.chunkSize)
 		}
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.updateViewportHeight()
 
 	case tea.KeyMsg:
 		if m.goToLineActive {
@@ -391,14 +401,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
 				m.gitCtx.Blame, m.err = m.collectBlame()
 			}
-		case "y":
+		case m.matchesKey(actionToggleLineNumbers, msg):
+			m.config.ShowLineNo = !m.config.ShowLineNo
+		case m.matchesKey(actionCopyDiff, msg):
 			m.copyDiff(export.FormatMarkdown)
-		case "o":
+		case m.matchesKey(actionSaveDiff, msg):
 			m.saveDiff(export.FormatHTML)
-		case "<":
-			m.adjustMinimapWidth(-2)
-		case m.matchesKey(actionMinimapWiden, msg):
-			m.adjustMinimapWidth(2)
 		case m.matchesKey(actionNextChange, msg):
 			m.jumpToNextChange()
 		case m.matchesKey(actionPrevChange, msg):
@@ -422,15 +430,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case m.matchesKey(actionNextBranch, msg):
 			m.selectNextBranch()
 		}
-
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.updateViewportHeight()
-	case tea.MouseMsg:
-		m.handleMouse(msg)
 	}
-
 	return m, nil
 }
 
@@ -492,16 +492,19 @@ func (m Model) renderTitle() string {
 // renderDiff renders the diff content
 func (m Model) renderDiff() string {
 	diffLines := m.currentLines()
-
-	// Calculate visible range
-	start := m.viewport.offset
-	end := min(start+m.viewport.height, len(diffLines))
-
-	if start >= len(diffLines) {
-		start = max(0, len(diffLines)-m.viewport.height)
-		m.viewport.offset = start
-		end = len(diffLines)
+	contentWidth := m.availableContentWidth()
+	bodyHeight := m.viewport.height
+	if m.sideBySideMode {
+		bodyHeight = max(1, bodyHeight-1)
 	}
+
+	start := m.viewport.offset
+	maxOffset := max(0, len(diffLines)-bodyHeight)
+	if start > maxOffset {
+		start = maxOffset
+		m.viewport.offset = start
+	}
+	end := min(start+bodyHeight, len(diffLines))
 
 	if start >= end || len(diffLines) == 0 {
 		if m.loading && m.statusMessage != "" {
@@ -510,41 +513,64 @@ func (m Model) renderDiff() string {
 		return m.styles.unchanged.Render("No differences found.")
 	}
 
-	contentWidth := m.availableContentWidth()
 	var lines []string
 	if m.sideBySideMode {
-		lines = m.renderSideBySideLines(start, end, contentWidth, diffLines)
+		lines = m.renderSideBySideLines(start, end, contentWidth)
 	} else {
-		lines = m.renderUnifiedLines(start, end, contentWidth, diffLines)
+		lines = m.renderUnifiedLines(start, end, contentWidth)
 	}
 
-	lines = m.padLines(lines, m.viewport.height)
+	lines = m.padLines(lines, bodyHeight)
 	mainView := lipgloss.NewStyle().Width(contentWidth).Render(strings.Join(lines, "\n"))
-	minimap := m.renderMinimap()
-	return lipgloss.JoinHorizontal(lipgloss.Top, mainView, minimap)
+	if m.sideBySideMode {
+		header := m.renderSideBySideHeader(contentWidth)
+		return lipgloss.JoinVertical(lipgloss.Left, header, mainView)
+	}
+	return mainView
 }
 
 func (m *Model) availableContentWidth() int {
-	width := m.width - m.minimapWidth
-	if width < 20 {
-		width = 20
+	width := m.width
+	if width <= 0 {
+		width = 120
 	}
-	m.minimapStartCol = width + 1
-	m.minimapHeight = m.viewport.height
+	if width < 40 {
+		width = 40
+	}
 	return width
 }
 
-func (m Model) renderUnifiedLines(start, end, contentWidth int, diffLines []diff.DiffLine) []string {
+func (m Model) renderSideBySideHeader(contentWidth int) string {
+	leftLabel := truncate(m.diffResult.File1Name, 70)
+	rightLabel := truncate(m.diffResult.File2Name, 70)
+	if m.gitCtx.Enabled {
+		leftLabel = fmt.Sprintf("%s (%s)", truncate(m.diffResult.File1Name, 50), m.gitCtx.Ref1)
+		rightLabel = fmt.Sprintf("%s (%s)", truncate(m.diffResult.File2Name, 50), m.gitCtx.Ref2)
+	}
+
+	separator := " │ "
+	columnWidth := (contentWidth - lipgloss.Width(separator)) / 2
+	if columnWidth < 18 {
+		columnWidth = 18
+	}
+
+	left := m.styles.section.Width(columnWidth).Render(truncateWidth(leftLabel, columnWidth))
+	right := m.styles.section.Width(columnWidth).Render(truncateWidth(rightLabel, columnWidth))
+	return left + separator + right
+}
+
+func (m Model) renderUnifiedLines(start, end, contentWidth int) []string {
 	var lines []string
+	diffLines := m.currentLines()
 
 	for i := start; i < end; i++ {
-		prefix, style, content, highlights := m.buildUnifiedLineParts(m.diffResult.Lines[i])
+		prefix, style, content, highlights := m.buildUnifiedLineParts(diffLines[i])
 		available := contentWidth - lipgloss.Width(prefix)
 		if available < 10 {
 			available = 10
 		}
 
-		segments := m.renderHighlightedSegments(content, highlights, style, m.highlightStyleForLine(m.diffResult.Lines[i]), available)
+		segments := m.renderHighlightedSegments(content, highlights, style, m.highlightStyleForLine(diffLines[i]), available)
 		for _, segment := range segments {
 			lines = append(lines, prefix+segment)
 		}
@@ -566,11 +592,11 @@ func (m Model) highlightStyleForLine(line diff.DiffLine) lipgloss.Style {
 
 func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
 	var lines []string
-
 	columnWidth := (contentWidth - 3) / 2
-	if columnWidth < 20 {
-		columnWidth = 20
+	if columnWidth < 18 {
+		columnWidth = 18
 	}
+	diffLines := m.currentLines()
 
 	for i := start; i < end; i++ {
 		line := diffLines[i]
@@ -578,11 +604,14 @@ func (m Model) renderSideBySideLines(start, end, contentWidth int) []string {
 		combinedLine := leftContent + " │ " + rightContent
 		if m.showBlame && m.gitCtx.Enabled {
 			if blameText, ok := m.gitCtx.Blame[line.LineNo2]; ok && blameText != "" {
-				combinedLine += "  " + m.styles.blame.Render(truncate(blameText, 60))
+				remaining := contentWidth - lipgloss.Width(combinedLine) - 2
+				if remaining > 10 {
+					combinedLine += "  " + m.styles.blame.Render(truncate(blameText, remaining))
+				}
 			}
 		}
 
-		lines = append(lines, truncateWidth(combinedLine, contentWidth))
+		lines = append(lines, combinedLine)
 		for s := 0; s < m.config.Spacing.LineSpacing; s++ {
 			lines = append(lines, "")
 		}
@@ -596,76 +625,6 @@ func (m Model) padLines(lines []string, target int) []string {
 		lines = append(lines, "")
 	}
 	return lines
-}
-
-func (m Model) renderMinimap() string {
-	height := m.viewport.height
-	if height < 1 {
-		height = 1
-	}
-	m.minimapHeight = height
-
-	width := m.minimapWidth
-	if width < 6 {
-		width = 6
-	}
-
-	diffLines := m.currentLines()
-	total := len(diffLines)
-	if total == 0 {
-		return ""
-	}
-
-	type bucket struct {
-		added   int
-		removed int
-		equal   int
-	}
-
-	buckets := make([]bucket, height)
-	for idx, line := range diffLines {
-		row := int(float64(idx) / float64(max(total, 1)) * float64(height))
-		if row >= height {
-			row = height - 1
-		}
-		switch line.Type {
-		case diff.Added:
-			buckets[row].added++
-		case diff.Removed:
-			buckets[row].removed++
-		default:
-			buckets[row].equal++
-		}
-	}
-
-	viewStart := int(float64(m.viewport.offset) / float64(max(total, 1)) * float64(height))
-	viewEnd := int(float64(min(m.viewport.offset+m.viewport.height, total)) / float64(max(total, 1)) * float64(height))
-	if viewEnd >= height {
-		viewEnd = height - 1
-	}
-
-	divider := m.styles.border.Render("│")
-	var rows []string
-	for i := 0; i < height; i++ {
-		bucket := buckets[i]
-		indicator := strings.Repeat("▐", width-1)
-
-		style := m.styles.unchanged
-		switch {
-		case bucket.added >= bucket.removed && bucket.added > bucket.equal:
-			style = m.styles.minimapAdd
-		case bucket.removed > bucket.added && bucket.removed > bucket.equal:
-			style = m.styles.minimapDel
-		}
-
-		if i >= viewStart && i <= viewEnd {
-			style = m.styles.selection
-		}
-
-		rows = append(rows, divider+style.Width(width-1).Render(indicator))
-	}
-
-	return strings.Join(rows, "\n")
 }
 
 func (m Model) buildUnifiedLineParts(line diff.DiffLine) (string, lipgloss.Style, string, []diff.Highlight) {
@@ -865,60 +824,6 @@ func offsetHighlights(highlights []diff.Highlight, delta int) []diff.Highlight {
 	return adjusted
 }
 
-func (m *Model) adjustMinimapWidth(delta int) {
-	m.minimapWidth += delta
-	if m.minimapWidth < 6 {
-		m.minimapWidth = 6
-	}
-	maxWidth := m.width / 3
-	if maxWidth < 10 {
-		maxWidth = 10
-	}
-	if m.minimapWidth > maxWidth {
-		m.minimapWidth = maxWidth
-	}
-}
-
-func (m *Model) lineForMinimapRow(row int) int {
-	total := len(m.currentLines())
-	if total == 0 {
-		return 0
-	}
-
-	if row < 0 {
-		row = 0
-	}
-	if row >= m.minimapHeight {
-		row = m.minimapHeight - 1
-	}
-
-	fraction := float64(row) / float64(max(m.minimapHeight, 1))
-	line := int(fraction * float64(total))
-	if line >= total {
-		line = total - 1
-	}
-	return line
-}
-
-func (m *Model) handleMouse(msg tea.MouseMsg) {
-	if msg.Action != tea.MouseActionPress && msg.Action != tea.MouseActionRelease {
-		return
-	}
-
-	if m.minimapStartCol == 0 || msg.X < m.minimapStartCol {
-		return
-	}
-
-	mapTop := 2 // Title occupies first line
-	if msg.Y < mapTop || msg.Y >= mapTop+m.minimapHeight {
-		return
-	}
-
-	targetRow := msg.Y - mapTop
-	line := m.lineForMinimapRow(targetRow)
-	m.jumpToOffset(line)
-}
-
 func (m *Model) jumpToNextChange() {
 	changes := m.changeOffsets()
 	for _, off := range changes {
@@ -1035,69 +940,9 @@ func (m Model) renderInlineColumn(content string, highlights []diff.Highlight, b
 	return applyHighlights(padded, localized, baseStyle, highlightStyle)
 }
 
-// renderLine renders a single diff line in unified mode
-func (m Model) renderLine(line diff.DiffLine) string {
-	var parts []string
-
-	// Line numbers
-	if m.config.ShowLineNo {
-		lineNo1, lineNo2 := m.lineNumberStrings(line)
-		parts = append(parts, m.styles.lineNumber.Render(lineNo1))
-		parts = append(parts, m.styles.lineNumber.Render(lineNo2))
-		parts = append(parts, " ")
-	}
-
-	// Content with appropriate styling
-	var symbol string
-	var style lipgloss.Style
-
-	// Apply syntax highlighting if enabled
-	if m.syntaxHighlight {
-		switch line.Type {
-		case diff.Added:
-			symbol = "+"
-			style = m.styles.added
-		case diff.Removed:
-			symbol = "-"
-			style = m.styles.removed
-		case diff.Equal:
-			symbol = " "
-			style = m.styles.unchanged
-		default:
-			symbol = " "
-			style = m.styles.unchanged
-		}
-	} else {
-		// No syntax highlighting - just show symbols
-		switch line.Type {
-		case diff.Added:
-			symbol = "+"
-		case diff.Removed:
-			symbol = "-"
-		case diff.Equal:
-			symbol = " "
-		default:
-			symbol = " "
-		}
-		style = m.styles.unchanged
-	}
-
-	content := symbol + " " + line.Content
-	parts = append(parts, style.Render(content))
-
-	if m.showBlame && m.gitCtx.Enabled {
-		if blameText, ok := m.gitCtx.Blame[line.LineNo2]; ok && blameText != "" {
-			parts = append(parts, "  "+m.styles.blame.Render(truncate(blameText, 60)))
-		}
-	}
-
-	return strings.Join(parts, "")
-}
-
 // renderStatusBar renders the status bar
 func (m Model) renderStatusBar() string {
 	added, removed, unchanged := m.currentStats()
-	totalLines := len(m.currentLines())
 
 	// View mode indicator
 	viewMode := "unified"
@@ -1204,8 +1049,8 @@ func (m Model) renderHelpPanel() string {
 		"  u         Half page up    │  y         Copy diff        │  o    Save diff (HTML)",
 		"  p         Command palette │  L         Go to line       │  g↵   Palette go-to-line",
 		"  w         Toggle wrapping │  S         Git status       │  B    Branch switcher",
-		"  H         Commit history  │  [ / ]     Cycle branches   │  < / > Resize minimap",
-		"  n / N     Next/prev change│  Mouse     Jump via minimap │  q    Quit",
+		"  H         Commit history  │  [ / ]     Cycle branches   │  ,    Settings",
+		"  n / N     Next/prev change│  ctrl+n    Toggle line nums │  q    Quit",
 		"",
 	}
 
@@ -1585,38 +1430,38 @@ func (m *Model) executePaletteSelection() {
 
 	entry := m.paletteEntries[m.paletteIndex]
 	switch entry.action {
-	case paletteActionToggleHelp:
+	case PaletteAction(paletteActionToggleHelp):
 		m.togglePanel(helpPanel)
-	case paletteActionToggleStats:
+	case PaletteAction(paletteActionToggleStats):
 		m.togglePanel(statsPanel)
-	case paletteActionToggleSideBySide:
+	case PaletteAction(paletteActionToggleSideBySide):
 		m.sideBySideMode = !m.sideBySideMode
-	case paletteActionToggleSyntax:
+	case PaletteAction(paletteActionToggleSyntax):
 		m.syntaxHighlight = !m.syntaxHighlight
-	case paletteActionToggleBlame:
+	case PaletteAction(paletteActionToggleBlame):
 		m.showBlame = !m.showBlame
 		if m.showBlame && m.gitCtx.Enabled && m.gitCtx.Blame == nil {
 			m.gitCtx.Blame, m.err = m.collectBlame()
 		}
-	case paletteActionToggleWrap:
+	case PaletteAction(paletteActionToggleWrap):
 		m.wrapLines = !m.wrapLines
-	case paletteActionOpenSettings:
+	case PaletteAction(paletteActionOpenSettings):
 		m.toggleSettings()
-	case paletteActionGoTop:
+	case PaletteAction(paletteActionGoTop):
 		m.scrollToTop()
-	case paletteActionGoBottom:
+	case PaletteAction(paletteActionGoBottom):
 		m.scrollToBottom()
-	case paletteActionGoToLine:
+	case PaletteAction(paletteActionGoToLine):
 		m.openGoToLineDialog()
-	case paletteActionJumpOffset:
+	case PaletteAction(paletteActionJumpOffset):
 		m.jumpToOffset(entry.offsetTarget)
-	case paletteActionCopyDiff:
+	case PaletteAction(paletteActionCopyDiff):
 		m.copyDiff(entry.format)
-	case paletteActionSaveDiff:
+	case PaletteAction(paletteActionSaveDiff):
 		m.saveDiff(entry.format)
 	}
 
-	if entry.action != paletteActionGoToLine {
+	if entry.action != PaletteAction(paletteActionGoToLine) {
 		m.showCommand = false
 	}
 	m.refreshPaletteEntries()
@@ -1624,49 +1469,41 @@ func (m *Model) executePaletteSelection() {
 }
 
 func (m *Model) refreshPaletteEntries() {
-	var entries []paletteEntry
+	var entries []PaletteEntry
 
 	entries = append(entries,
-		paletteEntry{section: "Commands", label: "Toggle help", description: "? / h", action: paletteActionToggleHelp},
-		paletteEntry{section: "Commands", label: "Toggle stats", description: "s", action: paletteActionToggleStats},
-		paletteEntry{section: "Commands", label: "Toggle side-by-side", description: "v", action: paletteActionToggleSideBySide},
-		paletteEntry{section: "Commands", label: "Toggle syntax colors", description: "c", action: paletteActionToggleSyntax},
-		paletteEntry{section: "Commands", label: "Toggle wrapping", description: "w", action: paletteActionToggleWrap},
-		paletteEntry{section: "Commands", label: "Settings", description: ",", action: paletteActionOpenSettings},
-		paletteEntry{section: "Commands", label: "Toggle blame", description: "b", action: paletteActionToggleBlame},
-		paletteEntry{section: "Commands", label: "Go to top", description: "g", action: paletteActionGoTop},
-		paletteEntry{section: "Commands", label: "Go to bottom", description: "G", action: paletteActionGoBottom},
-		paletteEntry{section: "Commands", label: "Go to line", description: "L", action: paletteActionGoToLine},
-		paletteEntry{section: "Export", label: "Copy diff (Markdown)", description: "y", action: paletteActionCopyDiff, format: export.FormatMarkdown},
-		paletteEntry{section: "Export", label: "Copy diff (ANSI)", description: "command palette", action: paletteActionCopyDiff, format: export.FormatANSI},
-		paletteEntry{section: "Export", label: "Save diff (HTML)", description: "o", action: paletteActionSaveDiff, format: export.FormatHTML},
+		PaletteEntry{section: "Commands", label: "Toggle help", description: "? / h", action: PaletteAction(paletteActionToggleHelp)},
+		PaletteEntry{section: "Commands", label: "Toggle stats", description: "s", action: PaletteAction(paletteActionToggleStats)},
+		PaletteEntry{section: "Commands", label: "Toggle side-by-side", description: "v", action: PaletteAction(paletteActionToggleSideBySide)},
+		PaletteEntry{section: "Commands", label: "Toggle syntax colors", description: "c", action: PaletteAction(paletteActionToggleSyntax)},
+		PaletteEntry{section: "Commands", label: "Toggle wrapping", description: "w", action: PaletteAction(paletteActionToggleWrap)},
+		PaletteEntry{section: "Commands", label: "Settings", description: ",", action: PaletteAction(paletteActionOpenSettings)},
+		PaletteEntry{section: "Commands", label: "Toggle blame", description: "b", action: PaletteAction(paletteActionToggleBlame)},
+		PaletteEntry{section: "Commands", label: "Go to top", description: "g", action: PaletteAction(paletteActionGoTop)},
+		PaletteEntry{section: "Commands", label: "Go to bottom", description: "G", action: PaletteAction(paletteActionGoBottom)},
+		PaletteEntry{section: "Commands", label: "Go to line", description: "L", action: PaletteAction(paletteActionGoToLine)},
+		PaletteEntry{section: "Export", label: "Copy diff (Markdown)", description: "y", action: PaletteAction(paletteActionCopyDiff), format: export.FormatMarkdown},
+		PaletteEntry{section: "Export", label: "Copy diff (ANSI)", description: "command palette", action: PaletteAction(paletteActionCopyDiff), format: export.FormatANSI},
+		PaletteEntry{section: "Export", label: "Save diff (HTML)", description: "o", action: PaletteAction(paletteActionSaveDiff), format: export.FormatHTML},
 	)
 
-	for _, offset := range m.changeOffsets() {
-		lines := m.currentLines()
-		if offset < 0 || offset >= len(lines) {
-			continue
-		}
-		line := lines[offset]
-		displayNo := displayLineNumber(line)
-		snippet := truncate(strings.TrimSpace(line.Content), 60)
-		entries = append(entries, paletteEntry{
-			section:      "Changes",
-			label:        fmt.Sprintf("Change at line %d", displayNo),
-			description:  snippet,
-			action:       paletteActionJumpOffset,
-			offsetTarget: offset,
+	jumpDistances := []int{10, 25, 50, 100}
+	for _, dist := range jumpDistances {
+		entries = append(entries, PaletteEntry{
+			section:      "Navigation",
+			label:        fmt.Sprintf("Jump +%d lines", dist),
+			description:  fmt.Sprintf("Jump forward %d lines", dist),
+			action:       PaletteAction(paletteActionJumpOffset),
+			offsetTarget: dist,
 		})
 	}
-
-	for _, ln := range m.lineAnchors() {
-		offset := m.offsetForLine(ln)
-		entries = append(entries, paletteEntry{
-			section:      "Lines",
-			label:        fmt.Sprintf("Line %d", ln),
-			description:  "Jump to line",
-			action:       paletteActionJumpOffset,
-			offsetTarget: offset,
+	for _, dist := range jumpDistances {
+		entries = append(entries, PaletteEntry{
+			section:      "Navigation",
+			label:        fmt.Sprintf("Jump -%d lines", dist),
+			description:  fmt.Sprintf("Jump backward %d lines", dist),
+			action:       PaletteAction(paletteActionJumpOffset),
+			offsetTarget: -dist,
 		})
 	}
 
@@ -1799,43 +1636,6 @@ func (m *Model) changeOffsets() []int {
 		prevChange = isChange
 	}
 	return offsets
-}
-
-func (m *Model) lineAnchors() []int {
-	if m.diffResult == nil {
-		return nil
-	}
-
-	total := len(m.diffResult.File2Lines)
-	if total == 0 {
-		total = len(m.currentLines())
-	}
-	if total == 0 {
-		return nil
-	}
-
-	step := total / 6
-	if step < 10 {
-		step = 10
-	}
-
-	anchors := []int{1}
-	for i := step; i < total; i += step {
-		anchors = append(anchors, i)
-	}
-	anchors = append(anchors, total)
-
-	unique := make(map[int]struct{})
-	var result []int
-	for _, v := range anchors {
-		if _, ok := unique[v]; ok {
-			continue
-		}
-		unique[v] = struct{}{}
-		result = append(result, v)
-	}
-
-	return result
 }
 
 func (m *Model) openGoToLineDialog() {

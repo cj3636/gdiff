@@ -175,6 +175,7 @@ gdiff --help
 ### 3. Vim-Style Navigation
 
 Users familiar with vim will feel at home with the navigation keys:
+
 - `j/k` for up/down
 - `g/G` for top/bottom
 - `d/u` for page down/up
@@ -220,7 +221,7 @@ gdiff base.txt incoming.txt
 
 ### Text Files
 
-```
+```text
 gdiff: old.txt ↔ new.txt
      1     1   Hello, World!
      2       - This is a test file.
@@ -230,7 +231,7 @@ gdiff: old.txt ↔ new.txt
 
 ### Configuration Files
 
-```
+```json
 gdiff: config_old.json ↔ config_new.json
      3       -   "version": "1.0.0",
            3 +   "version": "2.0.0",
@@ -238,9 +239,9 @@ gdiff: config_old.json ↔ config_new.json
            5 +     "host": "0.0.0.0",
 ```
 
-### Statistics View
+### Statistics
 
-```
+```text
 Diff Statistics
 ═══════════════
 

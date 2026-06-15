@@ -90,7 +90,7 @@ func parseExportFormat(raw string) (export.Format, error) {
 		return export.FormatMarkdown, nil
 	case string(export.FormatHTML), "htm":
 		return export.FormatHTML, nil
-	case string(export.FormatANSI), "text", "ansi":
+	case string(export.FormatANSI), "text":
 		return export.FormatANSI, nil
 	default:
 		return "", fmt.Errorf("unsupported export format: %s", raw)
@@ -321,7 +321,7 @@ func main() {
 	}
 
 	// Initialize configuration
-	cfg := config.DefaultConfig()
+	cfg = config.DefaultConfig()
 	cfg.ShowLineNo = !noLineNumber
 	cfg.TabSize = tabSize
 	cfg.IgnoreWhitespace = ignoreWhitespace

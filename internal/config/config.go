@@ -18,6 +18,8 @@ type Config struct {
 	IgnorePatterns   []string
 	Language         string
 	TokenPatterns    map[string]string
+	Spacing          SpacingOptions
+	Keybindings      Keybindings
 }
 
 // ThemePreset describes a named theme configuration.
@@ -75,6 +77,12 @@ func DefaultConfig() *Config {
 		IgnorePatterns:   []string{},
 		Language:         "",
 		TokenPatterns:    map[string]string{},
+		Spacing: SpacingOptions{
+			LinePadding:     1,
+			LineSpacing:     0,
+			LineNumberWidth: 4,
+		},
+		Keybindings: Keybindings{},
 	}
 }
 
@@ -150,8 +158,6 @@ func DefaultKeybindings() Keybindings {
 		"toggle_wrap":         {"w"},
 		"toggle_blame":        {"b"},
 		"toggle_line_numbers": {"ctrl+n"},
-		"minimap_narrow":      {"<"},
-		"minimap_widen":       {">"},
 		"next_change":         {"n"},
 		"prev_change":         {"N"},
 		"scroll_down":         {"j", "down"},
